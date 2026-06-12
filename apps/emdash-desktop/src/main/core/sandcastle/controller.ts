@@ -1,9 +1,9 @@
 import type {
   SandcastleTaskOptions,
   SandcastleTaskResult,
-} from '../../shared/core/sandcastle/sandcastle';
-import { createRPCController } from '../../shared/lib/ipc/rpc';
-import type { Result } from '../lib/result';
+} from '@shared/core/sandcastle/sandcastle';
+import { createRPCController } from '@shared/lib/ipc/rpc';
+import type { Result } from '@shared/lib/result';
 import { sandcastleService } from './sandcastle-service';
 
 export const sandcastleController = createRPCController({
