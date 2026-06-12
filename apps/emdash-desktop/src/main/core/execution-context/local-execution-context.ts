@@ -38,13 +38,14 @@ export class LocalExecutionContext implements IExecutionContext {
   }
 
   exec(command: string, args: string[] = [], opts: ExecOptions = {}): Promise<ExecResult> {
-    const { timeout, maxBuffer } = opts;
+    const { timeout, maxBuffer, input } = opts;
     return execFileAsync(this.resolveCommand(command), args, {
       cwd: this.root || undefined,
       env: command === 'git' ? buildNonInteractiveGitEnv() : undefined,
       timeout,
       maxBuffer,
       signal: this._signal(opts.signal),
+      ...(input !== undefined ? { input } : {}),
     }).catch((error) => {
       if (command === 'git' && isMissingGitExecutableError(error)) {
         throw missingGitExecutableError();

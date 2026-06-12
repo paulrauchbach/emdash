@@ -62,6 +62,11 @@ export class SshExecutionContext implements IExecutionContext {
       this.proxy.exec(full, (execErr, stream) => {
         if (execErr) return reject(execErr);
 
+        if (opts.input !== undefined) {
+          stream.write(opts.input);
+          stream.end();
+        }
+
         let stdout = '';
         let stderr = '';
         let settled = false;

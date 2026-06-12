@@ -1,6 +1,5 @@
-import type { Octokit } from '@octokit/rest';
-import type { GitHubApiAuthContext } from './github-api-auth-service';
-import { GitHubApiAuthErrorException, getOctokit } from './octokit-provider';
+import { LocalExecutionContext } from '@main/core/execution-context/local-execution-context';
+import { GitHubCli } from '../cli/github-cli';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -28,16 +27,15 @@ export interface GitHubOwner {
 }
 
 export interface GitHubRepositoryService {
-  listRepositories(authContext?: GitHubApiAuthContext): Promise<GitHubRepo[]>;
-  getOwners(authContext?: GitHubApiAuthContext): Promise<GitHubOwner[]>;
+  listRepositories(): Promise<GitHubRepo[]>;
+  getOwners(): Promise<GitHubOwner[]>;
   createRepository(params: {
     name: string;
     description?: string;
     owner: string;
     isPrivate: boolean;
-    authContext?: GitHubApiAuthContext;
   }): Promise<{ url: string; cloneUrl: string; defaultBranch: string; nameWithOwner: string }>;
-  deleteRepository(owner: string, name: string, authContext?: GitHubApiAuthContext): Promise<void>;
+  deleteRepository(owner: string, name: string): Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -65,32 +63,39 @@ interface RestRepo {
 // ---------------------------------------------------------------------------
 
 export class GitHubRepositoryServiceImpl implements GitHubRepositoryService {
-  constructor(
-    private readonly getOctokit: (
-      host: string,
-      authContext?: GitHubApiAuthContext
-    ) => Promise<Octokit>
-  ) {}
+  constructor(private readonly getCli: () => GitHubCli) {}
 
-  async listRepositories(authContext: GitHubApiAuthContext = {}): Promise<GitHubRepo[]> {
-    const octokit = await this.getOctokit(this.hostForAuthContext(authContext), authContext);
-    const { data } = await octokit.rest.repos.listForAuthenticatedUser({
-      per_page: 100,
-      sort: 'updated',
-      direction: 'desc',
+  async listRepositories(): Promise<GitHubRepo[]> {
+    const cli = this.getCli();
+    const result = await cli.rest<RestRepo[]>({
+      endpoint: 'user/repos',
+      paginate: true,
     });
-    return data.map((item) => this.mapRepo(item as unknown as RestRepo));
+    if (!result.success) {
+      throw new Error(result.error.message);
+    }
+    return result.data.map((item) => this.mapRepo(item));
   }
 
-  async getOwners(authContext: GitHubApiAuthContext = {}): Promise<GitHubOwner[]> {
-    const octokit = await this.getOctokit(this.hostForAuthContext(authContext), authContext);
-    const { data: user } = await octokit.rest.users.getAuthenticated();
-    const owners: GitHubOwner[] = [{ login: user.login, type: 'User' }];
+  async getOwners(): Promise<GitHubOwner[]> {
+    const cli = this.getCli();
+    const userResult = await cli.rest<{ login: string }>({
+      endpoint: 'user',
+    });
+    if (!userResult.success) {
+      throw new Error(userResult.error.message);
+    }
+    const owners: GitHubOwner[] = [{ login: userResult.data.login, type: 'User' }];
 
     try {
-      const { data: orgs } = await octokit.rest.orgs.listForAuthenticatedUser();
-      for (const org of orgs) {
-        owners.push({ login: org.login, type: 'Organization' });
+      const orgsResult = await cli.rest<{ login: string }[]>({
+        endpoint: 'user/orgs',
+        paginate: true,
+      });
+      if (orgsResult.success) {
+        for (const org of orgsResult.data) {
+          owners.push({ login: org.login, type: 'Organization' });
+        }
       }
     } catch {}
 
@@ -102,14 +107,15 @@ export class GitHubRepositoryServiceImpl implements GitHubRepositoryService {
     description?: string;
     owner: string;
     isPrivate: boolean;
-    authContext?: GitHubApiAuthContext;
   }): Promise<{ url: string; cloneUrl: string; defaultBranch: string; nameWithOwner: string }> {
-    const octokit = await this.getOctokit(
-      this.hostForAuthContext(params.authContext ?? {}),
-      params.authContext
-    );
-    const { data: user } = await octokit.rest.users.getAuthenticated();
-    const isCurrentUser = params.owner === user.login;
+    const cli = this.getCli();
+    const userResult = await cli.rest<{ login: string }>({
+      endpoint: 'user',
+    });
+    if (!userResult.success) {
+      throw new Error(userResult.error.message);
+    }
+    const isCurrentUser = params.owner === userResult.data.login;
 
     const createParams = {
       name: params.name,
@@ -117,9 +123,17 @@ export class GitHubRepositoryServiceImpl implements GitHubRepositoryService {
       private: params.isPrivate,
     };
 
-    const { data } = isCurrentUser
-      ? await octokit.rest.repos.createForAuthenticatedUser(createParams)
-      : await octokit.rest.repos.createInOrg({ ...createParams, org: params.owner });
+    const result = await cli.rest<RestRepo>({
+      endpoint: isCurrentUser ? 'user/repos' : `orgs/${params.owner}/repos`,
+      method: 'POST',
+      body: createParams,
+    });
+
+    if (!result.success) {
+      throw new Error(result.error.message);
+    }
+
+    const { data } = result;
 
     return {
       url: data.html_url,
@@ -129,19 +143,15 @@ export class GitHubRepositoryServiceImpl implements GitHubRepositoryService {
     };
   }
 
-  async deleteRepository(
-    owner: string,
-    name: string,
-    authContext: GitHubApiAuthContext = {}
-  ): Promise<void> {
-    const octokit = await this.getOctokit(this.hostForAuthContext(authContext), authContext);
-    await octokit.rest.repos.delete({ owner, repo: name });
-  }
-
-  private hostForAuthContext(authContext: GitHubApiAuthContext): string {
-    const accountId = authContext.accountId?.trim();
-    if (!accountId) return 'github.com';
-    return accountId.split(':')[0] || 'github.com';
+  async deleteRepository(owner: string, name: string): Promise<void> {
+    const cli = this.getCli();
+    const result = await cli.rest({
+      endpoint: `repos/${owner}/${name}`,
+      method: 'DELETE',
+    });
+    if (!result.success) {
+      throw new Error(result.error.message);
+    }
   }
 
   private mapRepo(item: RestRepo): GitHubRepo {
@@ -163,8 +173,6 @@ export class GitHubRepositoryServiceImpl implements GitHubRepositoryService {
   }
 }
 
-export const repoService = new GitHubRepositoryServiceImpl(async (host, authContext = {}) => {
-  const octokit = await getOctokit(host, authContext);
-  if (!octokit.success) throw new GitHubApiAuthErrorException(octokit.error);
-  return octokit.data;
+export const repoService = new GitHubRepositoryServiceImpl(() => {
+  return new GitHubCli(new LocalExecutionContext({ root: process.cwd() }));
 });

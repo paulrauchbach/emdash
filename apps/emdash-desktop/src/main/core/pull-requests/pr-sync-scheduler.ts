@@ -1,10 +1,6 @@
 import { eq } from 'drizzle-orm';
 import { gitWatcherRegistry } from '@main/core/git/git-watcher-registry';
 import { githubRepositoryResolver } from '@main/core/github/services/github-repository-resolver';
-import {
-  resolveProjectGitHubAuthContext,
-  type ProjectGitHubAuthContextError,
-} from '@main/core/github/services/project-github-auth-context';
 import { projectManager } from '@main/core/projects/project-manager';
 import { projectSettingsService } from '@main/core/projects/settings/project-settings-service';
 import { taskSessionManager } from '@main/core/tasks/task-session-manager';
@@ -161,27 +157,9 @@ export class PrSyncScheduler implements IInitializable, IDisposable {
     this._intervals.delete(projectId);
   }
 
-  private async _resolveAuthContext(
-    projectId: string,
-    remoteUrl: string,
-    kind: 'incremental' | 'single' = 'incremental'
-  ) {
-    const authContext = await resolveProjectGitHubAuthContext(projectId);
-    if (authContext.success) return authContext.data;
-
-    log.warn('PrSyncScheduler: failed to resolve project GitHub account context', {
-      projectId,
-      error: authContext.error.message,
-    });
-    this._emitAuthResolutionError(remoteUrl, kind, authContext.error);
-    return null;
-  }
-
   private async _syncRemote(projectId: string, remoteUrl: string): Promise<void> {
-    const authContext = await this._resolveAuthContext(projectId, remoteUrl);
-    if (!authContext) return;
     // sync() routes to full or incremental based on cursor state.
-    void prSyncEngine.sync(remoteUrl, authContext);
+    void prSyncEngine.sync(remoteUrl);
   }
 
   private async _syncRemotes(projectId: string, remoteUrls: string[]): Promise<void> {
@@ -191,23 +169,7 @@ export class PrSyncScheduler implements IInitializable, IDisposable {
   }
 
   private async _syncSingle(projectId: string, remoteUrl: string, prNumber: number): Promise<void> {
-    const authContext = await this._resolveAuthContext(projectId, remoteUrl, 'single');
-    if (!authContext) return;
-    void prSyncEngine.syncSingle(remoteUrl, prNumber, authContext);
-  }
-
-  private _emitAuthResolutionError(
-    remoteUrl: string,
-    kind: 'incremental' | 'single',
-    error: ProjectGitHubAuthContextError
-  ): void {
-    if (error.type !== 'unconfigured') return;
-    events.emit(prSyncProgressChannel, {
-      remoteUrl,
-      kind,
-      status: 'error',
-      error: error.message,
-    });
+    void prSyncEngine.syncSingle(remoteUrl, prNumber);
   }
 
   // ── Private helpers ────────────────────────────────────────────────────────

@@ -1,285 +1,114 @@
-import type { Octokit } from '@octokit/rest';
 import { describe, expect, it, vi } from 'vitest';
-import { ok } from '@shared/lib/result';
-import { getOctokit } from './octokit-provider';
-import { repoService } from './repo-service';
+import { GitHubRepositoryServiceImpl } from './repo-service';
 
-vi.mock('./octokit-provider', () => ({
-  getOctokit: vi.fn(),
-}));
-
-const mockGetOctokit = vi.mocked(getOctokit);
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-function makeOctokit(
-  overrides: Partial<{
-    reposListForAuthenticatedUser: ReturnType<typeof vi.fn>;
-    usersGetAuthenticated: ReturnType<typeof vi.fn>;
-    orgsListForAuthenticatedUser: ReturnType<typeof vi.fn>;
-    reposCreateForAuthenticatedUser: ReturnType<typeof vi.fn>;
-    reposCreateInOrg: ReturnType<typeof vi.fn>;
-    reposDelete: ReturnType<typeof vi.fn>;
-  }> = {}
-): Octokit {
-  return {
-    rest: {
-      repos: {
-        listForAuthenticatedUser:
-          overrides.reposListForAuthenticatedUser ?? vi.fn().mockResolvedValue({ data: [] }),
-        createForAuthenticatedUser: overrides.reposCreateForAuthenticatedUser ?? vi.fn(),
-        createInOrg: overrides.reposCreateInOrg ?? vi.fn(),
-        delete: overrides.reposDelete ?? vi.fn().mockResolvedValue({}),
-      },
-      users: {
-        getAuthenticated:
-          overrides.usersGetAuthenticated ??
-          vi.fn().mockResolvedValue({ data: { login: 'testuser' } }),
-      },
-      orgs: {
-        listForAuthenticatedUser:
-          overrides.orgsListForAuthenticatedUser ?? vi.fn().mockResolvedValue({ data: [] }),
-      },
-    },
-  } as unknown as Octokit;
-}
-
-// REST-shaped mock data (snake_case)
-const restRepo = {
-  id: 1,
-  name: 'my-repo',
-  full_name: 'testuser/my-repo',
-  description: 'A test repo',
-  html_url: 'https://github.com/testuser/my-repo',
-  clone_url: 'https://github.com/testuser/my-repo.git',
-  ssh_url: 'git@github.com:testuser/my-repo.git',
-  default_branch: 'main',
-  private: false,
-  updated_at: '2024-01-01T00:00:00Z',
-  language: 'TypeScript',
-  stargazers_count: 10,
-  forks_count: 2,
+const mockCli = {
+  rest: vi.fn(),
 };
 
-// Expected camelCase output
-const expectedRepo = {
-  id: 1,
-  name: 'my-repo',
-  nameWithOwner: 'testuser/my-repo',
-  description: 'A test repo',
-  url: 'https://github.com/testuser/my-repo',
-  cloneUrl: 'https://github.com/testuser/my-repo.git',
-  sshUrl: 'git@github.com:testuser/my-repo.git',
-  defaultBranch: 'main',
-  isPrivate: false,
-  updatedAt: '2024-01-01T00:00:00Z',
-  language: 'TypeScript',
-  stargazersCount: 10,
-  forksCount: 2,
-};
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+const repoService = new GitHubRepositoryServiceImpl(() => mockCli as any);
 
 describe('GitHubRepositoryServiceImpl', () => {
   describe('listRepositories', () => {
-    it('maps REST response to camelCase', async () => {
-      const octokit = makeOctokit({
-        reposListForAuthenticatedUser: vi.fn().mockResolvedValue({ data: [restRepo] }),
+    it('returns repositories mapped to camelCase', async () => {
+      mockCli.rest.mockResolvedValue({
+        success: true,
+        data: [
+          {
+            id: 1,
+            name: 'repo1',
+            full_name: 'owner/repo1',
+            description: null,
+            html_url: 'https://github.com/owner/repo1',
+            clone_url: 'https://github.com/owner/repo1.git',
+            ssh_url: 'git@github.com:owner/repo1.git',
+            default_branch: 'main',
+            private: false,
+            updated_at: '2024-01-01T00:00:00Z',
+            language: 'TypeScript',
+            stargazers_count: 10,
+            forks_count: 5,
+          },
+        ],
       });
-      mockGetOctokit.mockResolvedValue(ok(octokit));
 
       const result = await repoService.listRepositories();
 
-      expect(result).toEqual([expectedRepo]);
+      expect(result).toEqual([
+        {
+          id: 1,
+          name: 'repo1',
+          nameWithOwner: 'owner/repo1',
+          description: null,
+          url: 'https://github.com/owner/repo1',
+          cloneUrl: 'https://github.com/owner/repo1.git',
+          sshUrl: 'git@github.com:owner/repo1.git',
+          defaultBranch: 'main',
+          isPrivate: false,
+          updatedAt: '2024-01-01T00:00:00Z',
+          language: 'TypeScript',
+          stargazersCount: 10,
+          forksCount: 5,
+        },
+      ]);
     });
   });
 
   describe('getOwners', () => {
-    it('returns user + orgs', async () => {
-      const octokit = makeOctokit({
-        orgsListForAuthenticatedUser: vi.fn().mockResolvedValue({ data: [{ login: 'acme' }] }),
-      });
-      mockGetOctokit.mockResolvedValue(ok(octokit));
+    it('returns the user and organizations', async () => {
+      mockCli.rest
+        .mockResolvedValueOnce({ success: true, data: { login: 'alice' } })
+        .mockResolvedValueOnce({ success: true, data: [{ login: 'acme-corp' }] });
 
       const owners = await repoService.getOwners();
 
       expect(owners).toEqual([
-        { login: 'testuser', type: 'User' },
-        { login: 'acme', type: 'Organization' },
+        { login: 'alice', type: 'User' },
+        { login: 'acme-corp', type: 'Organization' },
       ]);
-    });
-
-    it('returns user only if orgs fail', async () => {
-      const octokit = makeOctokit({
-        orgsListForAuthenticatedUser: vi.fn().mockRejectedValue(new Error('forbidden')),
-      });
-      mockGetOctokit.mockResolvedValue(ok(octokit));
-
-      const owners = await repoService.getOwners();
-
-      expect(owners).toEqual([{ login: 'testuser', type: 'User' }]);
-    });
-
-    it('uses the requested GitHub account for owner lookup', async () => {
-      const octokit = makeOctokit();
-      mockGetOctokit.mockResolvedValue(ok(octokit));
-
-      await repoService.getOwners({ accountId: 'github.com:42' });
-
-      expect(mockGetOctokit).toHaveBeenCalledWith('github.com', { accountId: 'github.com:42' });
-    });
-
-    it('uses the selected GitHub Enterprise account host for owner lookup', async () => {
-      const octokit = makeOctokit();
-      mockGetOctokit.mockResolvedValue(ok(octokit));
-
-      await repoService.getOwners({ accountId: 'ghe.example.com:168' });
-
-      expect(mockGetOctokit).toHaveBeenCalledWith('ghe.example.com', {
-        accountId: 'ghe.example.com:168',
-      });
     });
   });
 
   describe('createRepository', () => {
-    it('creates for authenticated user', async () => {
-      const octokit = makeOctokit({
-        reposCreateForAuthenticatedUser: vi.fn().mockResolvedValue({
+    it('creates a repo for the user', async () => {
+      mockCli.rest
+        .mockResolvedValueOnce({ success: true, data: { login: 'alice' } })
+        .mockResolvedValueOnce({
+          success: true,
           data: {
-            html_url: 'https://github.com/testuser/new',
-            clone_url: 'https://github.com/testuser/new.git',
+            html_url: 'url',
+            clone_url: 'clone',
             default_branch: 'main',
-            full_name: 'testuser/new',
+            full_name: 'alice/repo',
           },
-        }),
-      });
-      mockGetOctokit.mockResolvedValue(ok(octokit));
+        });
 
       const result = await repoService.createRepository({
-        name: 'new',
-        owner: 'testuser',
-        isPrivate: false,
+        name: 'repo',
+        owner: 'alice',
+        isPrivate: true,
       });
 
-      expect(octokit.rest.repos.createForAuthenticatedUser).toHaveBeenCalled();
       expect(result).toEqual({
-        url: 'https://github.com/testuser/new',
-        cloneUrl: 'https://github.com/testuser/new.git',
+        url: 'url',
+        cloneUrl: 'clone',
         defaultBranch: 'main',
-        nameWithOwner: 'testuser/new',
+        nameWithOwner: 'alice/repo',
       });
-    });
-
-    it('creates in org when owner differs', async () => {
-      const octokit = makeOctokit({
-        reposCreateInOrg: vi.fn().mockResolvedValue({
-          data: {
-            html_url: 'https://github.com/acme/new',
-            clone_url: 'https://github.com/acme/new.git',
-            default_branch: 'main',
-            full_name: 'acme/new',
-          },
-        }),
+      expect(mockCli.rest).toHaveBeenCalledWith({
+        endpoint: 'user/repos',
+        method: 'POST',
+        body: { name: 'repo', description: undefined, private: true },
       });
-      mockGetOctokit.mockResolvedValue(ok(octokit));
-
-      await repoService.createRepository({ name: 'new', owner: 'acme', isPrivate: true });
-
-      expect(octokit.rest.repos.createInOrg).toHaveBeenCalledWith(
-        expect.objectContaining({ org: 'acme', name: 'new', private: true })
-      );
-    });
-
-    it('uses the requested GitHub account for repository creation', async () => {
-      const octokit = makeOctokit({
-        reposCreateForAuthenticatedUser: vi.fn().mockResolvedValue({
-          data: {
-            html_url: 'https://github.com/testuser/new',
-            clone_url: 'https://github.com/testuser/new.git',
-            default_branch: 'main',
-            full_name: 'testuser/new',
-          },
-        }),
-      });
-      mockGetOctokit.mockResolvedValue(ok(octokit));
-
-      await repoService.createRepository({
-        name: 'new',
-        owner: 'testuser',
-        isPrivate: false,
-        authContext: { accountId: 'github.com:42' },
-      });
-
-      expect(mockGetOctokit).toHaveBeenCalledWith('github.com', { accountId: 'github.com:42' });
-    });
-
-    it('uses the selected GitHub Enterprise account host for repository creation', async () => {
-      const octokit = makeOctokit({
-        reposCreateForAuthenticatedUser: vi.fn().mockResolvedValue({
-          data: {
-            html_url: 'https://ghe.example.com/testuser/new',
-            clone_url: 'https://ghe.example.com/testuser/new.git',
-            default_branch: 'main',
-            full_name: 'testuser/new',
-          },
-        }),
-      });
-      mockGetOctokit.mockResolvedValue(ok(octokit));
-
-      const result = await repoService.createRepository({
-        name: 'new',
-        owner: 'testuser',
-        isPrivate: false,
-        authContext: { accountId: 'ghe.example.com:168' },
-      });
-
-      expect(mockGetOctokit).toHaveBeenCalledWith('ghe.example.com', {
-        accountId: 'ghe.example.com:168',
-      });
-      expect(result.cloneUrl).toBe('https://ghe.example.com/testuser/new.git');
     });
   });
 
   describe('deleteRepository', () => {
-    it('calls repos.delete', async () => {
-      const octokit = makeOctokit();
-      mockGetOctokit.mockResolvedValue(ok(octokit));
-
-      await repoService.deleteRepository('testuser', 'old-repo');
-
-      expect(octokit.rest.repos.delete).toHaveBeenCalledWith({
-        owner: 'testuser',
-        repo: 'old-repo',
-      });
-    });
-
-    it('uses the requested GitHub account for repository deletion', async () => {
-      const octokit = makeOctokit();
-      mockGetOctokit.mockResolvedValue(ok(octokit));
-
-      await repoService.deleteRepository('testuser', 'old-repo', { accountId: 'github.com:42' });
-
-      expect(mockGetOctokit).toHaveBeenCalledWith('github.com', { accountId: 'github.com:42' });
-      expect(octokit.rest.repos.delete).toHaveBeenCalledWith({
-        owner: 'testuser',
-        repo: 'old-repo',
-      });
-    });
-
-    it('uses the selected GitHub Enterprise account host for repository deletion', async () => {
-      const octokit = makeOctokit();
-      mockGetOctokit.mockResolvedValue(ok(octokit));
-
-      await repoService.deleteRepository('testuser', 'old-repo', {
-        accountId: 'ghe.example.com:168',
-      });
-
-      expect(mockGetOctokit).toHaveBeenCalledWith('ghe.example.com', {
-        accountId: 'ghe.example.com:168',
+    it('deletes a repository', async () => {
+      mockCli.rest.mockResolvedValue({ success: true });
+      await repoService.deleteRepository('owner', 'repo');
+      expect(mockCli.rest).toHaveBeenCalledWith({
+        endpoint: 'repos/owner/repo',
+        method: 'DELETE',
       });
     });
   });

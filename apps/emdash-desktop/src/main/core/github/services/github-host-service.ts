@@ -1,4 +1,3 @@
-import { Octokit } from '@octokit/rest';
 import { log } from '@main/lib/logger';
 import { err, ok, type Result } from '@shared/lib/result';
 import { isGitHubDotComHost, normalizeRepositoryHost } from '@shared/repository-ref';
@@ -61,26 +60,29 @@ export class GitHubHostService {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
     try {
-      const octokit = new Octokit({ baseUrl: `https://${host}/api/v3` });
-      const response = await octokit.rest.meta.get({
-        request: { signal: controller.signal },
+      const response = await fetch(`https://${host}/api/v3/meta`, {
+        signal: controller.signal,
+        headers: {
+          Accept: 'application/vnd.github.v3+json',
+        },
       });
 
-      const data = response.data as unknown;
-      if (data && typeof data === 'object') return ok({ host });
-      return err({
-        type: 'not_github',
-        host,
-        reason: 'meta endpoint returned non-JSON response',
-      });
-    } catch (error) {
-      if (error && typeof error === 'object' && 'status' in error) {
-        const status = Number((error as { status: unknown }).status);
-        if (status === 401 || status === 403) return ok({ host });
-        return status === 404
-          ? err({ type: 'not_github', host, reason: 'meta endpoint returned 404' })
-          : err({ type: 'host_error', host, reason: `meta endpoint returned ${status}` });
+      if (response.ok) {
+        const data = await response.json().catch(() => null);
+        if (data && typeof data === 'object') return ok({ host });
+        return err({
+          type: 'not_github',
+          host,
+          reason: 'meta endpoint returned non-JSON response',
+        });
       }
+
+      if (response.status === 401 || response.status === 403) return ok({ host });
+
+      return response.status === 404
+        ? err({ type: 'not_github', host, reason: 'meta endpoint returned 404' })
+        : err({ type: 'host_error', host, reason: `meta endpoint returned ${response.status}` });
+    } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
       const result: HostProbeResult = err({
         type: isTlsError(error) ? 'host_error' : 'host_unreachable',

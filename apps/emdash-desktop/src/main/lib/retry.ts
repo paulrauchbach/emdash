@@ -30,7 +30,14 @@ export async function withRetry<T>(fn: () => Promise<T>, opts?: RetryOptions): P
       attempt++;
 
       const status = (err as { status?: number })?.status;
-      const isRetryable = status === undefined || status === 429 || status >= 500;
+      const code = (err as { code?: string })?.code;
+      const isRetryableCliError =
+        code === 'NETWORK_ERROR' ||
+        code === 'TIMEOUT' ||
+        code === 'RATE_LIMITED' ||
+        code === 'UNKNOWN_ERROR';
+      const isRetryableOctokitError = status === undefined || status === 429 || status >= 500;
+      const isRetryable = code ? isRetryableCliError : isRetryableOctokitError;
 
       if (!isRetryable || attempt >= maxAttempts || opts?.signal?.aborted) {
         throw err;

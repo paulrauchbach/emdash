@@ -38,6 +38,19 @@ function seedProject(fixture: Awaited<ReturnType<typeof openFixture>>, id = 'pro
     .run(id);
 }
 
+function seedTask(
+  fixture: Awaited<ReturnType<typeof openFixture>>,
+  id: string,
+  projectId: string,
+  automationRunId: string
+): void {
+  fixture.sqlite
+    .prepare(
+      `INSERT INTO tasks (id, project_id, name, status, automation_run_id, created_at, updated_at)
+       VALUES (?, ?, 'Task', 'open', ?, 0, 0)`
+    )
+    .run(id, projectId, automationRunId);
+}
 function seedAutomation(
   fixture: Awaited<ReturnType<typeof openFixture>>,
   opts: {
@@ -65,10 +78,12 @@ function seedAutomation(
 function getRunRow(
   fixture: Awaited<ReturnType<typeof openFixture>>,
   id: string
-): { status: string; error: string | null; task_id: string | null } | undefined {
+): { status: string; error: string | null; generated_task_name: string | null } | undefined {
   return fixture.sqlite
-    .prepare('SELECT status, error, task_id FROM automation_runs WHERE id = ?')
-    .get(id) as { status: string; error: string | null; task_id: string | null } | undefined;
+    .prepare('SELECT status, error, generated_task_name FROM automation_runs WHERE id = ?')
+    .get(id) as
+    | { status: string; error: string | null; generated_task_name: string | null }
+    | undefined;
 }
 
 function countRunsByStatus(
@@ -163,6 +178,9 @@ describe('AutomationScheduler recovery', () => {
       triggerKind: 'cron',
       startedAt: Date.now(),
     });
+    if (run.status === 'launching_task' || run.status === 'creating_conversation') {
+      seedTask(fixture, 'task-1', 'project-1', run.id);
+    }
 
     const scheduler = new AutomationScheduler(makeCallbacks(), doneExecutor);
     scheduler.start();
@@ -192,6 +210,9 @@ describe('AutomationScheduler recovery', () => {
       triggerKind: 'cron',
       startedAt: Date.now(),
     });
+    if (run.status === 'launching_task' || run.status === 'creating_conversation') {
+      seedTask(fixture, 'task-1', 'project-1', run.id);
+    }
 
     const scheduler = new AutomationScheduler(makeCallbacks(), doneExecutor);
     scheduler.start();
@@ -216,6 +237,9 @@ describe('AutomationScheduler recovery', () => {
       triggerKind: 'cron',
       startedAt: Date.now(),
     });
+    if (run.status === 'launching_task' || run.status === 'creating_conversation') {
+      seedTask(fixture, 'task-1', 'project-1', run.id);
+    }
 
     const scheduler = new AutomationScheduler(makeCallbacks(), doneExecutor);
     scheduler.start();
@@ -597,10 +621,12 @@ describe('AutomationScheduler concurrency', () => {
     expect(countRunsByStatus(fixture, 'creating_task')).toBe(4);
 
     // Release all remaining
-    for (const runId of executorCalls.slice(1)) {
-      releaseMap.get(runId)?.();
-    }
-    await vi.waitFor(() => expect(countRunsByStatus(fixture, 'done')).toBe(6));
+    await vi.waitFor(() => {
+      for (const runId of executorCalls.slice(1)) {
+        releaseMap.get(runId)?.();
+      }
+      expect(countRunsByStatus(fixture, 'done')).toBe(6);
+    });
   });
 });
 
@@ -632,15 +658,15 @@ describe('AutomationScheduler post-worker rescheduling', () => {
     const scheduler = new AutomationScheduler(makeCallbacks(), doneExecutor);
     await scheduler.drainQueue();
 
-    await vi.waitFor(() => expect(getRunRow(fixture, run.id)?.status).toBe('done'));
-
-    // A subsequent scheduled run should now exist
-    const nextRows = fixture.sqlite
-      .prepare(
-        "SELECT status FROM automation_runs WHERE automation_id = ? AND id != ? AND status = 'scheduled'"
-      )
-      .all(automationId, run.id) as { status: string }[];
-    expect(nextRows.length).toBeGreaterThanOrEqual(1);
+    await vi.waitFor(() => {
+      expect(getRunRow(fixture, run.id)?.status).toBe('done');
+      const nextRows = fixture.sqlite
+        .prepare(
+          "SELECT status FROM automation_runs WHERE automation_id = ? AND id != ? AND status = 'scheduled'"
+        )
+        .all(automationId, run.id) as { status: string }[];
+      expect(nextRows.length).toBeGreaterThanOrEqual(1);
+    });
   });
 });
 

@@ -15,8 +15,7 @@ type GitHubCliAccountImporter = Pick<GitHubCliAccountImportService, 'importAccou
 export class GitHubAccountService {
   constructor(
     private readonly accountStore: GitHubAccountStore,
-    private readonly cliAccountImporter: GitHubCliAccountImporter,
-    private readonly clearCachedClients: (host?: string, accountId?: string) => void = () => {}
+    private readonly cliAccountImporter: GitHubCliAccountImporter
   ) {}
 
   async listAccounts(): Promise<GitHubAccountSummary[]> {
@@ -49,7 +48,6 @@ export class GitHubAccountService {
     if (!account) return null;
 
     await this.accountStore.removeAccount(accountId);
-    this.clearCachedClients(account.host, account.id);
     return this.listAccounts();
   }
 

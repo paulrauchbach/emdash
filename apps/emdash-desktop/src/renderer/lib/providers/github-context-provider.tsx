@@ -17,7 +17,6 @@ import {
 
 type GithubContextValue = {
   user: GitHubUser | null;
-  cancelGithubConnect: () => void;
 };
 
 const GithubContext = createContext<GithubContextValue | null>(null);
@@ -117,17 +116,8 @@ export function GithubContextProvider({ children }: { children: React.ReactNode 
     };
   }, [handleDeviceFlowSuccess, handleDeviceFlowError, invalidateGitHubState]);
 
-  const cancelGithubConnect = useCallback(() => {
-    void rpc.github.authCancel();
-    toast({
-      title: 'GitHub connection unsuccessful',
-      description: 'Device flow was canceled',
-    });
-  }, [toast]);
-
   const value: GithubContextValue = {
     user,
-    cancelGithubConnect,
   };
 
   return <GithubContext.Provider value={value}>{children}</GithubContext.Provider>;
