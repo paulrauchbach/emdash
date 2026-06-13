@@ -9,8 +9,10 @@ import {
 import { err, ok, type Result } from '@shared/lib/result';
 import type { RepositoryRef } from '@shared/repository-ref';
 import { githubAccountRegistry } from './accounts/github-account-registry-instance';
+import type { GitHubApiAuthContext } from './services/github-api-auth-service';
 import { githubRepositoryResolver } from './services/github-repository-resolver';
 import { issueService } from './services/issue-service';
+import { resolveProjectGitHubAuthContext } from './services/project-github-auth-context';
 
 function toIssue(raw: {
   number: number;
@@ -92,9 +94,10 @@ function issueListErrorMetadata(error: IssueListError): IssueListErrorMetadata {
 
 async function listIssues(
   repository: RepositoryRef,
-  limit: number
+  limit: number,
+  authContext?: GitHubApiAuthContext
 ): Promise<Result<LinkedIssue[], IssueListError>> {
-  const issues = await issueService.listIssues(repository, limit);
+  const issues = await issueService.listIssues(repository, limit, authContext);
   if (!issues.success) return err(issues.error);
   return ok(issues.data.map(toIssue));
 }
@@ -102,15 +105,40 @@ async function listIssues(
 async function searchIssues(
   repository: RepositoryRef,
   searchTerm: string,
-  limit: number
+  limit: number,
+  authContext?: GitHubApiAuthContext
 ): Promise<Result<LinkedIssue[], IssueListError>> {
   if (!normalizeSearchTerm(searchTerm)) {
     return ok([]);
   }
 
-  const issues = await issueService.searchIssues(repository, searchTerm, limit);
+  const issues = await issueService.searchIssues(repository, searchTerm, limit, authContext);
   if (!issues.success) return err(issues.error);
   return ok(issues.data.map(toIssue));
+}
+
+async function resolveIssueAuthContext(
+  projectId: string | undefined
+): Promise<Result<GitHubApiAuthContext | undefined, IssueListError>> {
+  if (!projectId) return ok(undefined);
+  const authContext = await resolveProjectGitHubAuthContext(projectId);
+  if (authContext.success) return ok(authContext.data);
+  if (authContext.error.type === 'unconfigured') {
+    return err({
+      type: 'no_account_selected',
+      message: authContext.error.message,
+    });
+  }
+  if (authContext.error.type === 'disabled') {
+    return err({
+      type: 'account_disabled',
+      message: authContext.error.message,
+    });
+  }
+  return err({
+    type: 'generic',
+    message: `Unable to resolve GitHub account for project: ${authContext.error.message}`,
+  });
 }
 
 async function resolveRepository(opts: {
@@ -179,15 +207,19 @@ export const githubIssueProvider: IssueProvider = {
     const repository = await resolveRepository(opts);
     if (!repository.success) return toIssueListResult(repository);
 
-    return toIssueListResult(await listIssues(repository.data, opts.limit ?? 50));
+    const authContext = await resolveIssueAuthContext(opts.projectId);
+    if (!authContext.success) return toIssueListResult(err(authContext.error));
+    return toIssueListResult(await listIssues(repository.data, opts.limit ?? 50, authContext.data));
   },
 
   searchIssues: async (opts) => {
     const repository = await resolveRepository(opts);
     if (!repository.success) return toIssueListResult(repository);
 
+    const authContext = await resolveIssueAuthContext(opts.projectId);
+    if (!authContext.success) return toIssueListResult(err(authContext.error));
     return toIssueListResult(
-      await searchIssues(repository.data, opts.searchTerm, opts.limit ?? 20)
+      await searchIssues(repository.data, opts.searchTerm, opts.limit ?? 20, authContext.data)
     );
   },
 };

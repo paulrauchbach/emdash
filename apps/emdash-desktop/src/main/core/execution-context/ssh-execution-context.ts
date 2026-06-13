@@ -8,11 +8,19 @@ import { quoteShellArg } from '@main/utils/shellEscape';
 import { NON_INTERACTIVE_GIT_ENV } from './non-interactive-git-env';
 import type { ExecOptions, ExecResult, IExecutionContext } from './types';
 
-function withNonInteractiveGitEnv(command: string): string {
-  if (command !== 'git') return command;
-  const envPrefix = Object.entries(NON_INTERACTIVE_GIT_ENV)
-    .map(([key, value]) => `${key}=${quoteShellArg(value)}`)
+function withCommandEnv(command: string, env: NodeJS.ProcessEnv = {}): string {
+  const commandEnv = command === 'git' ? { ...env, ...NON_INTERACTIVE_GIT_ENV } : env;
+  const envPrefix = Object.entries(commandEnv)
+    .filter((entry): entry is [string, string] => entry[1] !== undefined)
+    .map(([key]) => {
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) {
+        throw new Error(`Invalid environment variable name: ${key}`);
+      }
+      return key;
+    })
+    .map((key) => `${key}=${quoteShellArg(commandEnv[key]!)}`)
     .join(' ');
+  if (!envPrefix) return command;
   return `${envPrefix} ${command}`;
 }
 
@@ -25,10 +33,11 @@ export function buildSshCommand(
   root: string | undefined,
   command: string,
   args: string[],
-  profile?: RemoteShellProfile
+  profile?: RemoteShellProfile,
+  env?: NodeJS.ProcessEnv
 ): string {
   const escaped = args.map(quoteShellArg).join(' ');
-  const executable = withNonInteractiveGitEnv(command);
+  const executable = withCommandEnv(command, env);
   const inner = args.length ? `${executable} ${escaped}` : executable;
   const body = root ? `cd ${quoteShellArg(root)} && ${inner}` : inner;
   return buildRemoteShellCommand(profile ?? FALLBACK_REMOTE_SHELL_PROFILE, body);
@@ -50,7 +59,7 @@ export class SshExecutionContext implements IExecutionContext {
   async exec(command: string, args: string[] = [], opts: ExecOptions = {}): Promise<ExecResult> {
     const { signal } = opts;
     const profile = await this.proxy.getRemoteShellProfile();
-    const full = buildSshCommand(this.root, command, args, profile);
+    const full = buildSshCommand(this.root, command, args, profile, opts.env);
     const combined = this._signal(signal);
 
     return new Promise((resolve, reject) => {

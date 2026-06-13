@@ -1,17 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { GitHubCli } from '@main/core/github/cli/github-cli';
-import type { GitHubCliError } from '@main/core/github/cli/github-cli-errors';
 import { err, ok } from '@shared/lib/result';
-import type { Result } from '@shared/lib/result';
 import { PrSyncEngine } from './pr-sync-engine';
 import { toPrApiError } from './pr-sync-errors';
 
-vi.mock('@main/core/github/cli/github-cli-instance', () => ({
-  githubCli: {
-    rest: vi.fn(),
-    graphql: vi.fn(),
-    authStatus: vi.fn(),
-  },
+vi.mock('@main/core/github/cli/github-cli-provider', () => ({
+  getGitHubCli: vi.fn(),
 }));
 
 vi.mock('@main/db/client', () => ({
@@ -49,6 +43,10 @@ function makeGitHubCli(overrides: {
   } as unknown as GitHubCli;
 }
 
+function makeGetCli(cli: GitHubCli) {
+  return vi.fn().mockResolvedValue(ok(cli));
+}
+
 function flushPromises(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0));
 }
@@ -59,7 +57,8 @@ describe('PrSyncEngine', () => {
       .fn()
       .mockResolvedValue(ok({ html_url: 'https://ghe.example.com/acme/repo/pull/12', number: 12 }));
     const cli = makeGitHubCli({ rest });
-    const engine = new PrSyncEngine(cli);
+    const getCli = makeGetCli(cli);
+    const engine = new PrSyncEngine(getCli);
 
     const result = await engine.createPullRequest({
       repositoryUrl: 'https://ghe.example.com/acme/repo',
@@ -69,6 +68,7 @@ describe('PrSyncEngine', () => {
       draft: false,
     });
 
+    expect(getCli).toHaveBeenCalledWith('ghe.example.com', {});
     expect(rest).toHaveBeenCalledWith({
       endpoint: 'repos/acme/repo/pulls',
       method: 'POST',
@@ -91,25 +91,24 @@ describe('PrSyncEngine', () => {
         err({ code: 'NOT_AUTHENTICATED', message: 'GitHub authentication required.' })
       );
     const cli = makeGitHubCli({ graphql });
-    const engine = new PrSyncEngine(cli);
+    const getCli = makeGetCli(cli);
+    const engine = new PrSyncEngine(getCli);
 
-    void engine.sync('https://github.com/acme/repo');
+    void engine.sync('https://github.com/acme/repo', { accountId: 'github.com:42' });
     await flushPromises();
 
-    // The account ID routing should ideally be passed, but the current `GitHubCli` signature
-    // does not support `accountId` directly yet. For now, it passes `host`.
-    // We verify `graphql` is called with the target host.
+    expect(getCli).toHaveBeenCalledWith('github.com', { accountId: 'github.com:42' });
     expect(graphql).toHaveBeenCalledWith(expect.objectContaining({ host: 'github.com' }));
   });
 
   it('returns the in-flight repository sync result to duplicate callers', async () => {
-    let resolveCli!: (value: any) => void;
+    let resolveCli!: (value: unknown) => void;
     const graphqlPromise = new Promise((resolve) => {
       resolveCli = resolve;
     });
     const graphql = vi.fn().mockReturnValue(graphqlPromise);
     const cli = makeGitHubCli({ graphql });
-    const engine = new PrSyncEngine(cli);
+    const engine = new PrSyncEngine(makeGetCli(cli));
 
     const first = engine.sync('https://ghe.example.com/acme/repo');
     await flushPromises();
@@ -141,7 +140,7 @@ describe('PrSyncEngine', () => {
         ok({ repository: { pullRequests: { nodes: [], pageInfo: { hasNextPage: false } } } })
       );
     const cli = makeGitHubCli({ graphql });
-    const engine = new PrSyncEngine(cli);
+    const engine = new PrSyncEngine(makeGetCli(cli));
 
     const result = engine.sync('https://github.com/acme/repo');
     engine.cancel('https://github.com/acme/repo');
@@ -160,7 +159,7 @@ describe('PrSyncEngine', () => {
       .fn()
       .mockResolvedValue(err({ code: 'UNKNOWN_ERROR', message: '404 Not Found' }));
     const cli = makeGitHubCli({ rest });
-    const engine = new PrSyncEngine(cli);
+    const engine = new PrSyncEngine(makeGetCli(cli));
 
     await expect(
       engine.createPullRequest({
@@ -195,13 +194,13 @@ describe('PrSyncEngine', () => {
   });
 
   it('preserves typed auth errors for duplicate in-flight single PR sync calls', async () => {
-    let resolveCli!: (value: any) => void;
+    let resolveCli!: (value: unknown) => void;
     const graphqlPromise = new Promise((resolve) => {
       resolveCli = resolve;
     });
     const graphql = vi.fn().mockReturnValue(graphqlPromise);
     const cli = makeGitHubCli({ graphql });
-    const engine = new PrSyncEngine(cli);
+    const engine = new PrSyncEngine(makeGetCli(cli));
 
     const first = engine.syncSingle('https://ghe.example.com/acme/repo', 12);
     const second = engine.syncSingle('https://ghe.example.com/acme/repo', 12);

@@ -14,6 +14,9 @@ const { LocalExecutionContext } = await import('./local-execution-context');
 
 class FakeChildProcess extends EventEmitter {
   stdout = Object.assign(new EventEmitter(), { setEncoding: vi.fn() });
+  stdin = {
+    end: vi.fn(),
+  };
 
   kill = vi.fn();
 }
@@ -58,6 +61,45 @@ describe('LocalExecutionContext', () => {
 
     await expect(ctx.exec('git', ['status'])).rejects.toThrow(
       'Git is not installed or Emdash cannot find it'
+    );
+  });
+
+  it('writes buffered command input to stdin and closes it', async () => {
+    const child = new FakeChildProcess();
+    execFileMock.mockImplementation((_command, _args, _options, callback) => {
+      queueMicrotask(() => callback(null, '{"ok":true}', ''));
+      return child;
+    });
+    const ctx = new LocalExecutionContext({ root: '/repo' });
+
+    await expect(
+      ctx.exec('gh', ['api', 'graphql'], { input: '{"query":"query { viewer }"}' })
+    ).resolves.toEqual({
+      stdout: '{"ok":true}',
+      stderr: '',
+    });
+
+    expect(child.stdin.end).toHaveBeenCalledWith('{"query":"query { viewer }"}');
+  });
+
+  it('merges command-specific environment variables with the process environment', async () => {
+    execFileMock.mockImplementation((_command, _args, _options, callback) => {
+      callback(null, { stdout: '', stderr: '' });
+    });
+    const ctx = new LocalExecutionContext({ root: '/repo' });
+
+    await ctx.exec('gh', ['api', 'user'], { env: { GH_TOKEN: 'selected-token' } });
+
+    expect(execFileMock).toHaveBeenCalledWith(
+      'gh',
+      ['api', 'user'],
+      expect.objectContaining({
+        env: expect.objectContaining({
+          GH_TOKEN: 'selected-token',
+          PATH: process.env.PATH,
+        }),
+      }),
+      expect.any(Function)
     );
   });
 

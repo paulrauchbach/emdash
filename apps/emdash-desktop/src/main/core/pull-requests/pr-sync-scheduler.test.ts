@@ -1,5 +1,4 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { prSyncProgressChannel } from '@shared/core/pull-requests/prEvents';
 import { ok } from '@shared/lib/result';
 import { prSyncEngine } from './pr-sync-engine';
 import { PrSyncScheduler } from './pr-sync-scheduler';
@@ -17,6 +16,7 @@ const mocks = vi.hoisted(() => {
     getProject: vi.fn(),
     projectOn: vi.fn(),
     emit: vi.fn(),
+    resolveProjectGitHubAuthContext: vi.fn(),
   };
 });
 
@@ -28,6 +28,10 @@ vi.mock('@main/core/github/services/github-repository-resolver', () => ({
   githubRepositoryResolver: {
     resolve: mocks.resolveRepository,
   },
+}));
+
+vi.mock('@main/core/github/services/project-github-auth-context', () => ({
+  resolveProjectGitHubAuthContext: mocks.resolveProjectGitHubAuthContext,
 }));
 
 vi.mock('@main/core/git/git-watcher-registry', () => ({
@@ -82,6 +86,7 @@ type SchedulerInternals = {
 describe('PrSyncScheduler', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.resolveProjectGitHubAuthContext.mockResolvedValue(ok({ accountId: 'github.com:42' }));
   });
 
   it('syncs mounted project remotes', async () => {
@@ -111,7 +116,9 @@ describe('PrSyncScheduler', () => {
 
       await scheduler.onProjectMounted('project-1');
 
-      expect(prSyncEngine.sync).toHaveBeenCalledWith('https://github.com/acme/repo');
+      expect(prSyncEngine.sync).toHaveBeenCalledWith('https://github.com/acme/repo', {
+        accountId: 'github.com:42',
+      });
 
       scheduler.onProjectUnmounted('project-1');
     } finally {
@@ -144,7 +151,9 @@ describe('PrSyncScheduler', () => {
 
     await scheduler.onProjectMounted('project-1');
 
-    expect(prSyncEngine.sync).toHaveBeenCalledWith('https://ghe.example.com/acme/repo');
+    expect(prSyncEngine.sync).toHaveBeenCalledWith('https://ghe.example.com/acme/repo', {
+      accountId: 'github.com:42',
+    });
   });
 
   it('resyncs on schedule', async () => {
@@ -175,8 +184,12 @@ describe('PrSyncScheduler', () => {
       await scheduler.onProjectMounted('project-1');
       await vi.advanceTimersByTimeAsync(5 * 60 * 1000);
 
-      expect(prSyncEngine.sync).toHaveBeenNthCalledWith(1, 'https://github.com/acme/repo');
-      expect(prSyncEngine.sync).toHaveBeenNthCalledWith(2, 'https://github.com/acme/repo');
+      expect(prSyncEngine.sync).toHaveBeenNthCalledWith(1, 'https://github.com/acme/repo', {
+        accountId: 'github.com:42',
+      });
+      expect(prSyncEngine.sync).toHaveBeenNthCalledWith(2, 'https://github.com/acme/repo', {
+        accountId: 'github.com:42',
+      });
 
       scheduler.onProjectUnmounted('project-1');
     } finally {

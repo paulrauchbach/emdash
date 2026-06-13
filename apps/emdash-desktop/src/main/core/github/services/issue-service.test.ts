@@ -1,12 +1,18 @@
 import { describe, expect, it, vi } from 'vitest';
 import { err, ok } from '@shared/lib/result';
+import type { GitHubCli } from '../cli/github-cli';
 import { GitHubIssueServiceImpl } from './issue-service';
+
+vi.mock('../cli/github-cli-provider', () => ({
+  getGitHubCli: vi.fn(),
+}));
 
 const mockCli = {
   rest: vi.fn(),
 };
 
-const issueService = new GitHubIssueServiceImpl(() => mockCli as any);
+const getCli = vi.fn().mockResolvedValue(ok(mockCli as unknown as GitHubCli));
+const issueService = new GitHubIssueServiceImpl(getCli);
 
 const restIssue = {
   number: 1,
@@ -48,6 +54,11 @@ describe('GitHubIssueServiceImpl', () => {
     it('maps REST response to camelCase', async () => {
       mockCli.rest.mockResolvedValue({ success: true, data: [restIssue] });
       const result = await issueService.listIssues(repository, 30);
+      expect(getCli).toHaveBeenCalledWith('github.com', {});
+      expect(mockCli.rest).toHaveBeenCalledWith({
+        endpoint: 'repos/owner/repo/issues?state=open&per_page=30&sort=updated&direction=desc',
+        host: 'github.com',
+      });
       expect(result).toEqual(ok([expectedIssue]));
     });
 
@@ -56,6 +67,17 @@ describe('GitHubIssueServiceImpl', () => {
       mockCli.rest.mockResolvedValue({ success: true, data: [restIssue, pr] });
       const result = await issueService.listIssues(repository);
       expect(result).toEqual(ok([expectedIssue]));
+    });
+
+    it('returns no more issues than requested', async () => {
+      mockCli.rest.mockResolvedValue({
+        success: true,
+        data: [restIssue, { ...restIssue, number: 2 }, { ...restIssue, number: 3 }],
+      });
+
+      const result = await issueService.listIssues(repository, 2);
+
+      expect(result.success && result.data).toHaveLength(2);
     });
 
     it('maps network errors to host reachability failures', async () => {
@@ -89,5 +111,13 @@ describe('GitHubIssueServiceImpl', () => {
       const result = await issueService.getIssue(repository, 42);
       expect(result).toEqual(ok({ ...expectedIssue, body: 'Issue body' }));
     });
+  });
+
+  it('passes the selected account to CLI resolution', async () => {
+    mockCli.rest.mockResolvedValue({ success: true, data: [] });
+
+    await issueService.listIssues(repository, 30, { accountId: 'github.com:42' });
+
+    expect(getCli).toHaveBeenCalledWith('github.com', { accountId: 'github.com:42' });
   });
 });

@@ -4,7 +4,10 @@ import { err, ok } from '@shared/lib/result';
 import { pullRequestController } from './controller';
 import { prQueryService } from './pr-query-service';
 import { prSyncEngine } from './pr-sync-engine';
-import { resolveProjectPullRequestContext } from './project-pull-request-context';
+import {
+  resolveProjectPullRequestAuthContext,
+  resolveProjectPullRequestContext,
+} from './project-pull-request-context';
 
 const dbMocks = vi.hoisted(() => ({
   select: vi.fn(),
@@ -60,12 +63,14 @@ vi.mock('./pr-sync-engine', () => ({
 }));
 
 vi.mock('./project-pull-request-context', () => ({
+  resolveProjectPullRequestAuthContext: vi.fn(),
   resolveProjectPullRequestContext: vi.fn(),
 }));
 
 const mockPrSyncEngine = vi.mocked(prSyncEngine);
 const mockPrQueryService = vi.mocked(prQueryService);
 const mockProviderRepositoryService = vi.mocked(providerRepositoryService);
+const mockResolveProjectPullRequestAuthContext = vi.mocked(resolveProjectPullRequestAuthContext);
 const mockResolveProjectPullRequestContext = vi.mocked(resolveProjectPullRequestContext);
 
 const selectedAuthContext = { accountId: 'github.com:42' };
@@ -85,6 +90,7 @@ function mockProjectGithubContext(
       host: overrides.host ?? 'github.com',
       repositoryUrl: overrides.repositoryUrl ?? 'https://github.com/acme/repo',
       nameWithOwner: overrides.nameWithOwner ?? 'acme/repo',
+      authContext: overrides.authContext ?? selectedAuthContext,
     })
   );
 }
@@ -122,6 +128,7 @@ describe('pullRequestController', () => {
     dbMocks.select.mockReset();
     mockPrSyncEngine.forceFullSync.mockResolvedValue(ok());
     mockPrSyncEngine.sync.mockResolvedValue(ok());
+    mockResolveProjectPullRequestAuthContext.mockResolvedValue(ok(selectedAuthContext));
   });
 
   it('rejects cross-host pull request creation before calling GitHub', async () => {
@@ -265,7 +272,10 @@ describe('pullRequestController', () => {
 
     await expect(pullRequestController.syncPullRequests('project-1')).resolves.toEqual(ok());
 
-    expect(mockPrSyncEngine.sync).toHaveBeenCalledWith('https://github.com/acme/repo');
+    expect(mockPrSyncEngine.sync).toHaveBeenCalledWith(
+      'https://github.com/acme/repo',
+      selectedAuthContext
+    );
   });
 
   it('forwards project-scoped PR sync failures', async () => {
@@ -304,7 +314,10 @@ describe('pullRequestController', () => {
       ok()
     );
 
-    expect(mockPrSyncEngine.forceFullSync).toHaveBeenCalledWith('https://github.com/acme/repo');
+    expect(mockPrSyncEngine.forceFullSync).toHaveBeenCalledWith(
+      'https://github.com/acme/repo',
+      selectedAuthContext
+    );
   });
 
   it('forwards force-full PR sync auth failures', async () => {
@@ -388,8 +401,12 @@ describe('pullRequestController', () => {
     );
 
     expect(mockResolveProjectPullRequestContext).not.toHaveBeenCalled();
-    expect(mockPrSyncEngine.createPullRequest).toHaveBeenCalledWith(params);
-    expect(mockPrSyncEngine.syncSingle).toHaveBeenCalledWith('https://github.com/acme/repo', 12);
+    expect(mockPrSyncEngine.createPullRequest).toHaveBeenCalledWith(params, selectedAuthContext);
+    expect(mockPrSyncEngine.syncSingle).toHaveBeenCalledWith(
+      'https://github.com/acme/repo',
+      12,
+      selectedAuthContext
+    );
   });
 
   it('passes the project GitHub account context to pull request mutations', async () => {
@@ -411,13 +428,19 @@ describe('pullRequestController', () => {
     expect(mockPrSyncEngine.mergePullRequest).toHaveBeenCalledWith(
       'https://github.com/acme/repo',
       12,
-      { strategy: 'squash', commitHeadOid: 'head-sha' }
+      { strategy: 'squash', commitHeadOid: 'head-sha' },
+      selectedAuthContext
     );
     expect(mockPrSyncEngine.markReadyForReview).toHaveBeenCalledWith(
       'https://github.com/acme/repo',
-      12
+      12,
+      selectedAuthContext
     );
-    expect(mockPrSyncEngine.syncSingle).toHaveBeenCalledWith('https://github.com/acme/repo', 12);
+    expect(mockPrSyncEngine.syncSingle).toHaveBeenCalledWith(
+      'https://github.com/acme/repo',
+      12,
+      selectedAuthContext
+    );
   });
 
   it('passes the project GitHub account context to pull request reads', async () => {
@@ -440,18 +463,25 @@ describe('pullRequestController', () => {
       pullRequestController.getPullRequestComments('project-1', 'https://github.com/acme/repo', 12)
     ).resolves.toEqual(ok({ comments: [] }));
 
-    expect(mockPrSyncEngine.syncSingle).toHaveBeenCalledWith('https://github.com/acme/repo', 12);
+    expect(mockPrSyncEngine.syncSingle).toHaveBeenCalledWith(
+      'https://github.com/acme/repo',
+      12,
+      selectedAuthContext
+    );
     expect(mockPrSyncEngine.syncChecks).toHaveBeenCalledWith(
       'https://github.com/acme/repo/pull/12',
-      'abc'
+      'abc',
+      selectedAuthContext
     );
     expect(mockPrSyncEngine.getPullRequestFiles).toHaveBeenCalledWith(
       'https://github.com/acme/repo',
-      12
+      12,
+      selectedAuthContext
     );
     expect(mockPrSyncEngine.getPullRequestComments).toHaveBeenCalledWith(
       'https://github.com/acme/repo',
-      12
+      12,
+      selectedAuthContext
     );
   });
 
@@ -513,7 +543,8 @@ describe('pullRequestController', () => {
     ).resolves.toEqual(ok({ url: 'https://pr.test', number: 12 }));
     expect(mockPrSyncEngine.syncSingle).toHaveBeenCalledWith(
       'https://ghe.example.com/acme/repo',
-      12
+      12,
+      selectedAuthContext
     );
   });
 });

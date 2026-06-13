@@ -1,11 +1,18 @@
 import { describe, expect, it, vi } from 'vitest';
+import { ok } from '@shared/lib/result';
+import type { GitHubCli } from '../cli/github-cli';
 import { GitHubRepositoryServiceImpl } from './repo-service';
+
+vi.mock('../cli/github-cli-provider', () => ({
+  getGitHubCli: vi.fn(),
+}));
 
 const mockCli = {
   rest: vi.fn(),
 };
 
-const repoService = new GitHubRepositoryServiceImpl(() => mockCli as any);
+const getCli = vi.fn().mockResolvedValue(ok(mockCli as unknown as GitHubCli));
+const repoService = new GitHubRepositoryServiceImpl(getCli);
 
 describe('GitHubRepositoryServiceImpl', () => {
   describe('listRepositories', () => {
@@ -33,6 +40,7 @@ describe('GitHubRepositoryServiceImpl', () => {
 
       const result = await repoService.listRepositories();
 
+      expect(getCli).toHaveBeenCalledWith('github.com', {});
       expect(result).toEqual([
         {
           id: 1,
@@ -98,6 +106,7 @@ describe('GitHubRepositoryServiceImpl', () => {
         endpoint: 'user/repos',
         method: 'POST',
         body: { name: 'repo', description: undefined, private: true },
+        host: 'github.com',
       });
     });
   });
@@ -109,7 +118,19 @@ describe('GitHubRepositoryServiceImpl', () => {
       expect(mockCli.rest).toHaveBeenCalledWith({
         endpoint: 'repos/owner/repo',
         method: 'DELETE',
+        host: 'github.com',
       });
     });
+  });
+
+  it('routes a selected enterprise account to its host', async () => {
+    mockCli.rest.mockResolvedValue({ success: true, data: [] });
+
+    await repoService.listRepositories({ accountId: 'ghe.example.com:42' });
+
+    expect(getCli).toHaveBeenCalledWith('ghe.example.com', {
+      accountId: 'ghe.example.com:42',
+    });
+    expect(mockCli.rest).toHaveBeenCalledWith(expect.objectContaining({ host: 'ghe.example.com' }));
   });
 });

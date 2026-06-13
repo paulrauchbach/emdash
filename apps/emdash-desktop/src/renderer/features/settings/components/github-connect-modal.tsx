@@ -1,4 +1,4 @@
-import { AlertCircle, Github, Loader2, Terminal } from 'lucide-react';
+import { AlertCircle, Loader2, Terminal } from 'lucide-react';
 import { useState } from 'react';
 import { useToast } from '@renderer/lib/hooks/use-toast';
 import { useImportGitHubCliAccounts } from '@renderer/lib/hooks/useGithubAccounts';

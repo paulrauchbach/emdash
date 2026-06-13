@@ -1,6 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { and, eq, inArray, lt, ne } from 'drizzle-orm';
 import type { GitHubCli } from '@main/core/github/cli/github-cli';
+import { getGitHubCli } from '@main/core/github/cli/github-cli-provider';
+import type { GitHubApiAuthError } from '@main/core/github/services/github-api-auth-errors';
+import type { GitHubApiAuthContext } from '@main/core/github/services/github-api-auth-service';
 import {
   GET_PR_BY_NUMBER_QUERY,
   GET_PR_CHECK_RUNS_BY_URL_QUERY,
@@ -39,7 +42,6 @@ import {
   isPrSyncHostUnreachable,
   prSyncEngineErrorMessage,
   toPrApiError,
-  mapCliErrorToPrError,
   type PrSyncEngineError,
 } from './pr-sync-errors';
 import { assemblePullRequest } from './pr-utils';
@@ -69,6 +71,12 @@ type IncrementalSyncCursor = {
 type PrKvSchema = {
   [key: string]: FullSyncCursor | IncrementalSyncCursor | string;
 };
+
+type PrSyncAuthContext = Pick<GitHubApiAuthContext, 'accountId'>;
+
+function authContextKey(authContext: PrSyncAuthContext = {}): string {
+  return authContext.accountId?.trim() || 'default';
+}
 
 function syncCancelledError(): PrSyncEngineError {
   return {
@@ -164,6 +172,35 @@ interface GqlStatusContextNode {
   createdAt: string;
 }
 
+interface RestPullRequestComment {
+  id: number;
+  body: string | null;
+  html_url: string;
+  user: { id: number; login: string; avatar_url: string; html_url: string } | null;
+  path?: string | null;
+  line?: number | null;
+  original_line?: number | null;
+  position?: number | null;
+  created_at: string;
+  updated_at: string;
+}
+
+interface RestPullRequestReview {
+  id: number;
+  body: string | null;
+  html_url: string;
+  user: { id: number; login: string; avatar_url: string; html_url: string } | null;
+  submitted_at: string | null;
+}
+
+interface RestPullRequestFile {
+  filename: string;
+  status: string;
+  additions: number;
+  deletions: number;
+  patch?: string;
+}
+
 // ---------------------------------------------------------------------------
 // PrSyncEngine
 // ---------------------------------------------------------------------------
@@ -181,7 +218,12 @@ export class PrSyncEngine {
   >();
   private readonly _checksInflight = new Map<string, Promise<Result<boolean, PrSyncEngineError>>>();
 
-  constructor(private readonly cli: GitHubCli) {}
+  constructor(
+    private readonly getCli: (
+      host: string,
+      context?: PrSyncAuthContext
+    ) => Promise<Result<GitHubCli, GitHubApiAuthError>>
+  ) {}
 
   // ── Public sync API ────────────────────────────────────────────────────────
 
@@ -189,8 +231,8 @@ export class PrSyncEngine {
    * Smart sync: resumes a full sync if one is incomplete, otherwise runs an
    * incremental sync. Deduplicated — callers share the in-flight result.
    */
-  sync(repositoryUrl: string): Promise<RepositorySyncResult> {
-    const key = `sync:${repositoryUrl}:default`;
+  sync(repositoryUrl: string, authContext: PrSyncAuthContext = {}): Promise<RepositorySyncResult> {
+    const key = `sync:${repositoryUrl}:${authContextKey(authContext)}`;
     const existing = this._inflight.get(key);
     if (existing) {
       log.info('PrSyncEngine: sync already in flight, skipping', {
@@ -206,8 +248,8 @@ export class PrSyncEngine {
       .then((cursor) => {
         if (ctrl.signal.aborted) return err(syncCancelledError());
         return cursor?.done
-          ? this._runIncrementalSync(repositoryUrl, ctrl.signal)
-          : this._runFullSync(repositoryUrl, ctrl.signal);
+          ? this._runIncrementalSync(repositoryUrl, ctrl.signal, authContext)
+          : this._runFullSync(repositoryUrl, ctrl.signal, authContext);
       })
       .catch((e: unknown) => {
         if ((e as { name?: string }).name === 'AbortError') {
@@ -248,13 +290,16 @@ export class PrSyncEngine {
   }
 
   /** Cancel any in-flight sync, wipe both cursors, and start a fresh full sync. */
-  async forceFullSync(repositoryUrl: string): Promise<RepositorySyncResult> {
+  async forceFullSync(
+    repositoryUrl: string,
+    authContext: PrSyncAuthContext = {}
+  ): Promise<RepositorySyncResult> {
     this.cancel(repositoryUrl);
     await Promise.all([
       this.kv.del(`fullsync:${repositoryUrl}`),
       this.kv.del(`incrementalsync:${repositoryUrl}`),
     ]);
-    return this.sync(repositoryUrl);
+    return this.sync(repositoryUrl, authContext);
   }
 
   /** Abort and discard any in-flight sync for this repository URL. */
@@ -315,7 +360,8 @@ export class PrSyncEngine {
    */
   private async _runFullSync(
     repositoryUrl: string,
-    signal: AbortSignal
+    signal: AbortSignal,
+    authContext: PrSyncAuthContext
   ): Promise<RepositorySyncResult> {
     log.info('PrSyncEngine: runFullSync start', { repositoryUrl });
     const repository = parseRepositoryRefResult(repositoryUrl);
@@ -329,6 +375,16 @@ export class PrSyncEngine {
       return err(repository.error);
     }
     const { owner, repo } = repository.data;
+    const cli = await this.getCli(repository.data.host, authContext);
+    if (!cli.success) {
+      this._emitProgress({
+        remoteUrl: repositoryUrl,
+        kind: 'full',
+        status: 'error',
+        error: prSyncEngineErrorMessage(cli.error),
+      });
+      return err(cli.error);
+    }
 
     // Resume from an existing cursor if available
     const existing = (await this.kv.get(`fullsync:${repositoryUrl}`)) as FullSyncCursor | null;
@@ -357,7 +413,7 @@ export class PrSyncEngine {
         const response = await withRetry(
           () =>
             githubRateLimiter.acquire().then(() =>
-              this.cli
+              cli.data
                 .graphql<{
                   repository: {
                     pullRequests: {
@@ -375,7 +431,6 @@ export class PrSyncEngine {
                     owner,
                     repo,
                     cursor: pageCursor ?? null,
-                    request: { signal },
                   },
                   host: repository.data.host,
                   signal,
@@ -461,7 +516,8 @@ export class PrSyncEngine {
    */
   private async _runIncrementalSync(
     repositoryUrl: string,
-    signal: AbortSignal
+    signal: AbortSignal,
+    authContext: PrSyncAuthContext
   ): Promise<RepositorySyncResult> {
     log.info('PrSyncEngine: runIncrementalSync started', { repositoryUrl });
 
@@ -476,6 +532,16 @@ export class PrSyncEngine {
       return err(repository.error);
     }
     const { owner, repo } = repository.data;
+    const cli = await this.getCli(repository.data.host, authContext);
+    if (!cli.success) {
+      this._emitProgress({
+        remoteUrl: repositoryUrl,
+        kind: 'incremental',
+        status: 'error',
+        error: prSyncEngineErrorMessage(cli.error),
+      });
+      return err(cli.error);
+    }
 
     const fullCursor = (await this.kv.get(`fullsync:${repositoryUrl}`)) as FullSyncCursor | null;
     const incrementalCursor = (await this.kv.get(
@@ -511,7 +577,7 @@ export class PrSyncEngine {
         const response = await withRetry(
           () =>
             githubRateLimiter.acquire().then(() =>
-              this.cli
+              cli.data
                 .graphql<{
                   repository: {
                     pullRequests: {
@@ -528,7 +594,6 @@ export class PrSyncEngine {
                     owner,
                     repo,
                     cursor: pageCursor ?? null,
-                    request: { signal },
                   },
                   host: repository.data.host,
                   signal,
@@ -633,16 +698,17 @@ export class PrSyncEngine {
   /** Sync a single PR by number. Deduplicated — awaits any in-flight call for the same PR. */
   async syncSingle(
     repositoryUrl: string,
-    prNumber: number
+    prNumber: number,
+    authContext: PrSyncAuthContext = {}
   ): Promise<Result<PullRequest | null, PrSyncEngineError>> {
-    const key = `single:${repositoryUrl}:${prNumber}:default`;
+    const key = `single:${repositoryUrl}:${prNumber}:${authContextKey(authContext)}`;
     if (this._singleInflight.has(key)) {
       return await this._singleInflight.get(key)!;
     }
 
     const ctrl = new AbortController();
 
-    const promise = this._runSyncSingle(repositoryUrl, prNumber, ctrl.signal)
+    const promise = this._runSyncSingle(repositoryUrl, prNumber, ctrl.signal, authContext)
       .catch((e: unknown) => {
         if ((e as { name?: string }).name !== 'AbortError') {
           log.error('PrSyncEngine: syncSingle failed', {
@@ -665,19 +731,22 @@ export class PrSyncEngine {
   private async _runSyncSingle(
     repositoryUrl: string,
     prNumber: number,
-    signal: AbortSignal
+    signal: AbortSignal,
+    authContext: PrSyncAuthContext
   ): Promise<Result<PullRequest | null, PrSyncEngineError>> {
     if (signal.aborted) return ok(null);
 
     const repository = parseRepositoryRefResult(repositoryUrl);
     if (!repository.success) return err(repository.error);
     const { owner, repo } = repository.data;
+    const cli = await this.getCli(repository.data.host, authContext);
+    if (!cli.success) return err(cli.error);
 
     let response: { repository: { pullRequest: GqlPrNode | null } };
     try {
       response = await withRetry(() =>
         githubRateLimiter.acquire().then(() =>
-          this.cli
+          cli.data
             .graphql<{
               repository: { pullRequest: GqlPrNode | null };
             }>({
@@ -728,16 +797,17 @@ export class PrSyncEngine {
    */
   async syncChecks(
     pullRequestUrl: string,
-    headRefOid: string
+    headRefOid: string,
+    authContext: PrSyncAuthContext = {}
   ): Promise<Result<boolean, PrSyncEngineError>> {
-    const key = `checks:${pullRequestUrl}:${headRefOid}:default`;
+    const key = `checks:${pullRequestUrl}:${headRefOid}:${authContextKey(authContext)}`;
     if (this._checksInflight.has(key)) {
       return await this._checksInflight.get(key)!;
     }
 
     const ctrl = new AbortController();
 
-    const promise = this._runSyncChecks(pullRequestUrl, headRefOid, ctrl.signal)
+    const promise = this._runSyncChecks(pullRequestUrl, headRefOid, ctrl.signal, authContext)
       .catch((e: unknown) => {
         if ((e as { name?: string }).name !== 'AbortError') {
           log.error('PrSyncEngine: syncChecks failed', {
@@ -759,7 +829,8 @@ export class PrSyncEngine {
   private async _runSyncChecks(
     pullRequestUrl: string,
     headRefOid: string,
-    signal: AbortSignal
+    signal: AbortSignal,
+    authContext: PrSyncAuthContext
   ): Promise<Result<boolean, PrSyncEngineError>> {
     if (signal.aborted) return ok(false);
 
@@ -794,6 +865,8 @@ export class PrSyncEngine {
     const repository = parseRepositoryRefResult(pr[0].repositoryUrl);
     if (!repository.success) return err(repository.error);
     const { owner, repo } = repository.data;
+    const cli = await this.getCli(repository.data.host, authContext);
+    if (!cli.success) return err(cli.error);
 
     type CheckNode = GqlCheckRunNode | GqlStatusContextNode;
     const allNodes: CheckNode[] = [];
@@ -827,8 +900,8 @@ export class PrSyncEngine {
       try {
         response = await withRetry(() =>
           githubRateLimiter.acquire().then(() =>
-            this.cli
-              .graphql<any>({
+            cli.data
+              .graphql<typeof response>({
                 query: GET_PR_CHECK_RUNS_BY_URL_QUERY,
                 variables: {
                   owner,
@@ -1205,21 +1278,26 @@ export class PrSyncEngine {
 
   // ── Mutation helpers (for controller use) ──────────────────────────────────
 
-  async createPullRequest(params: {
-    repositoryUrl: string;
-    headRepositoryUrl?: string;
-    head: string;
-    base: string;
-    title: string;
-    body?: string;
-    draft: boolean;
-  }): Promise<Result<{ url: string; number: number }, PrSyncEngineError>> {
+  async createPullRequest(
+    params: {
+      repositoryUrl: string;
+      headRepositoryUrl?: string;
+      head: string;
+      base: string;
+      title: string;
+      body?: string;
+      draft: boolean;
+    },
+    authContext: PrSyncAuthContext = {}
+  ): Promise<Result<{ url: string; number: number }, PrSyncEngineError>> {
     const repository = parseRepositoryRefResult(params.repositoryUrl);
     if (!repository.success) return err(repository.error);
     const { owner, repo } = repository.data;
+    const cli = await this.getCli(repository.data.host, authContext);
+    if (!cli.success) return err(cli.error);
 
     try {
-      const res = await this.cli.rest<{ html_url: string; number: number }>({
+      const res = await cli.data.rest<{ html_url: string; number: number }>({
         endpoint: `repos/${owner}/${repo}/pulls`,
         method: 'POST',
         body: {
@@ -1250,17 +1328,20 @@ export class PrSyncEngine {
   async mergePullRequest(
     repositoryUrl: string,
     prNumber: number,
-    options: PullRequestMergeOptions
+    options: PullRequestMergeOptions,
+    authContext: PrSyncAuthContext = {}
   ): Promise<Result<{ sha: string | null; merged: boolean }, PrSyncEngineError>> {
     const repository = parseRepositoryRefResult(repositoryUrl);
     if (!repository.success) return err(repository.error);
     const { owner, repo } = repository.data;
+    const cli = await this.getCli(repository.data.host, authContext);
+    if (!cli.success) return err(cli.error);
 
     try {
       // GitHub exposes bypassing branch protection/rulesets through the caller's permissions,
       // not a REST merge parameter. `bypassRequirements` is captured by the UI/telemetry path;
       // the merge request itself remains identical and GitHub accepts or rejects it server-side.
-      const res = await this.cli.rest<{ sha: string | null; merged: boolean }>({
+      const res = await cli.data.rest<{ sha: string | null; merged: boolean }>({
         endpoint: `repos/${owner}/${repo}/pulls/${prNumber}/merge`,
         method: 'PUT',
         body: { merge_method: options.strategy, sha: options.commitHeadOid },
@@ -1286,20 +1367,23 @@ export class PrSyncEngine {
 
   async markReadyForReview(
     repositoryUrl: string,
-    prNumber: number
+    prNumber: number,
+    authContext: PrSyncAuthContext = {}
   ): Promise<Result<void, PrSyncEngineError>> {
     const repository = parseRepositoryRefResult(repositoryUrl);
     if (!repository.success) return err(repository.error);
     const { owner, repo } = repository.data;
+    const cli = await this.getCli(repository.data.host, authContext);
+    if (!cli.success) return err(cli.error);
 
     try {
-      const res = await this.cli.rest<{ node_id: string }>({
+      const res = await cli.data.rest<{ node_id: string }>({
         endpoint: `repos/${owner}/${repo}/pulls/${prNumber}`,
         host: repository.data.host,
       });
       if (!res.success) throw res.error;
       const data = res.data;
-      const gqlRes = await this.cli.graphql<any>({
+      const gqlRes = await cli.data.graphql<{ markPullRequestReadyForReview: unknown }>({
         query: `mutation MarkReadyForReview($id: ID!) {
         markPullRequestReadyForReview(input: { pullRequestId: $id }) {
           pullRequest { isDraft }
@@ -1324,11 +1408,14 @@ export class PrSyncEngine {
 
   async getPullRequestComments(
     repositoryUrl: string,
-    prNumber: number
+    prNumber: number,
+    authContext: PrSyncAuthContext = {}
   ): Promise<Result<PullRequestComment[], PrSyncEngineError>> {
     const repository = parseRepositoryRefResult(repositoryUrl);
     if (!repository.success) return err(repository.error);
     const { owner, repo } = repository.data;
+    const cli = await this.getCli(repository.data.host, authContext);
+    if (!cli.success) return err(cli.error);
 
     const pullRequestUrl = `${repository.data.repositoryUrl}/pull/${prNumber}`;
 
@@ -1336,8 +1423,8 @@ export class PrSyncEngine {
       const [issueComments, reviewComments, reviews] = await Promise.all([
         withRetry(() =>
           githubRateLimiter.acquire().then(() =>
-            this.cli
-              .rest<any[]>({
+            cli.data
+              .rest<RestPullRequestComment[]>({
                 endpoint: `repos/${owner}/${repo}/issues/${prNumber}/comments?per_page=100`,
                 paginate: true,
                 host: repository.data.host,
@@ -1350,8 +1437,8 @@ export class PrSyncEngine {
         ),
         withRetry(() =>
           githubRateLimiter.acquire().then(() =>
-            this.cli
-              .rest<any[]>({
+            cli.data
+              .rest<RestPullRequestComment[]>({
                 endpoint: `repos/${owner}/${repo}/pulls/${prNumber}/comments?per_page=100`,
                 paginate: true,
                 host: repository.data.host,
@@ -1364,8 +1451,8 @@ export class PrSyncEngine {
         ),
         withRetry(() =>
           githubRateLimiter.acquire().then(() =>
-            this.cli
-              .rest<any[]>({
+            cli.data
+              .rest<RestPullRequestReview[]>({
                 endpoint: `repos/${owner}/${repo}/pulls/${prNumber}/reviews?per_page=100`,
                 paginate: true,
                 host: repository.data.host,
@@ -1439,14 +1526,17 @@ export class PrSyncEngine {
 
   async getPullRequestFiles(
     repositoryUrl: string,
-    prNumber: number
+    prNumber: number,
+    authContext: PrSyncAuthContext = {}
   ): Promise<Result<PullRequestFile[], PrSyncEngineError>> {
     const repository = parseRepositoryRefResult(repositoryUrl);
     if (!repository.success) return err(repository.error);
     const { owner, repo } = repository.data;
+    const cli = await this.getCli(repository.data.host, authContext);
+    if (!cli.success) return err(cli.error);
 
     try {
-      const res = await this.cli.rest<any[]>({
+      const res = await cli.data.rest<RestPullRequestFile[]>({
         endpoint: `repos/${owner}/${repo}/pulls/${prNumber}/files?per_page=100`,
         paginate: true,
         host: repository.data.host,
@@ -1479,5 +1569,4 @@ export class PrSyncEngine {
   }
 }
 
-import { githubCli } from '@main/core/github/cli/github-cli-instance';
-export const prSyncEngine = new PrSyncEngine(githubCli);
+export const prSyncEngine = new PrSyncEngine(getGitHubCli);

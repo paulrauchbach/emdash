@@ -4,6 +4,7 @@ import { githubAccountRegistry } from './accounts/github-account-registry-instan
 import { githubIssueProvider } from './github-issue-provider';
 import { githubRepositoryResolver } from './services/github-repository-resolver';
 import { issueService } from './services/issue-service';
+import { resolveProjectGitHubAuthContext } from './services/project-github-auth-context';
 
 vi.mock('./services/issue-service', () => ({
   issueService: {
@@ -26,9 +27,14 @@ vi.mock('./services/github-repository-resolver', () => ({
   },
 }));
 
+vi.mock('./services/project-github-auth-context', () => ({
+  resolveProjectGitHubAuthContext: vi.fn(),
+}));
+
 const mockIssueService = vi.mocked(issueService);
 const mockRepositoryResolver = vi.mocked(githubRepositoryResolver);
 const mockGithubAccountRegistry = vi.mocked(githubAccountRegistry);
+const mockResolveProjectGitHubAuthContext = vi.mocked(resolveProjectGitHubAuthContext);
 
 const githubRepository = {
   host: 'github.com',
@@ -53,6 +59,7 @@ describe('githubIssueProvider', () => {
     mockGithubAccountRegistry.getDefaultAccountId.mockResolvedValue(null);
     mockGithubAccountRegistry.listAccounts.mockResolvedValue([]);
     mockGithubAccountRegistry.resolveToken.mockResolvedValue(null);
+    mockResolveProjectGitHubAuthContext.mockResolvedValue(ok({ accountId: 'github.com:42' }));
   });
 
   it('reports GitHub connected when a default linked account exists', async () => {
@@ -106,10 +113,13 @@ describe('githubIssueProvider', () => {
 
     await githubIssueProvider.listIssues({
       repositoryUrl: 'https://github.com/owner/repo',
+      projectId: 'project-1',
       limit: 7,
     });
 
-    expect(mockIssueService.listIssues).toHaveBeenCalledWith(githubRepository, 7);
+    expect(mockIssueService.listIssues).toHaveBeenCalledWith(githubRepository, 7, {
+      accountId: 'github.com:42',
+    });
   });
 
   it('falls back to the resolved remote when repositoryUrl is not provided', async () => {
@@ -121,7 +131,12 @@ describe('githubIssueProvider', () => {
       limit: 3,
     });
 
-    expect(mockIssueService.searchIssues).toHaveBeenCalledWith(githubRepository, 'bug', 3);
+    expect(mockIssueService.searchIssues).toHaveBeenCalledWith(
+      githubRepository,
+      'bug',
+      3,
+      undefined
+    );
   });
 
   it('returns unsupported host errors from repository resolution', async () => {

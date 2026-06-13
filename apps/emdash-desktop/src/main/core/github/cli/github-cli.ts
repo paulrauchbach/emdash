@@ -1,5 +1,6 @@
 import type { IExecutionContext } from '@main/core/execution-context/types';
 import { err, ok, type Result } from '@shared/lib/result';
+import { isGitHubDotComHost } from '@shared/repository-ref';
 import { createCliError, type GitHubCliError } from './github-cli-errors';
 import type {
   GitHubCliIdentity,
@@ -7,8 +8,22 @@ import type {
   GitHubRestRequest,
 } from './github-cli-types';
 
+type GitHubCliAuthAccount = {
+  active?: boolean;
+  state?: string;
+  host?: string;
+  login?: string;
+};
+
+function errorDetails(error: unknown): { code?: unknown; message?: unknown } {
+  return error && typeof error === 'object' ? (error as { code?: unknown; message?: unknown }) : {};
+}
+
 export class GitHubCli {
-  constructor(private readonly execContext: IExecutionContext) {}
+  constructor(
+    private readonly execContext: IExecutionContext,
+    private readonly options: { token?: string } = {}
+  ) {}
 
   async authStatus(host: string): Promise<Result<GitHubCliIdentity, GitHubCliError>> {
     try {
@@ -28,13 +43,15 @@ export class GitHubCli {
         );
       }
 
-      const data = JSON.parse(result.stdout);
-      const hostData = data?.hosts?.[host];
+      const data = JSON.parse(result.stdout) as {
+        hosts?: Record<string, GitHubCliAuthAccount[]>;
+      };
+      const hostData = data.hosts?.[host];
       if (!hostData || !Array.isArray(hostData) || hostData.length === 0) {
         return err(createCliError('NOT_AUTHENTICATED', `No active account for ${host}`));
       }
 
-      const activeAccount = hostData.find((a: any) => a.active === true) || hostData[0];
+      const activeAccount = hostData.find((account) => account.active === true) ?? hostData[0];
       if (activeAccount.state !== 'success') {
         return err(
           createCliError(
@@ -43,20 +60,28 @@ export class GitHubCli {
           )
         );
       }
+      if (!activeAccount.host || !activeAccount.login) {
+        return err(
+          createCliError('NOT_AUTHENTICATED', `Incomplete authentication status for ${host}`)
+        );
+      }
 
       return ok({
         host: activeAccount.host,
         user: activeAccount.login,
       });
-    } catch (e: any) {
-      if (e?.code === 'ENOENT') {
-        return err(createCliError('CLI_MISSING', 'GitHub CLI (gh) is not installed', e));
+    } catch (error: unknown) {
+      const details = errorDetails(error);
+      if (details.code === 'ENOENT') {
+        return err(createCliError('CLI_MISSING', 'GitHub CLI (gh) is not installed', error));
       }
+      const message =
+        typeof details.message === 'string' ? details.message : String(details.message ?? error);
       return err(
         createCliError(
           'NOT_AUTHENTICATED',
-          `Not authenticated or gh auth status failed: ${e?.message}`,
-          e
+          `Not authenticated or gh auth status failed: ${message}`,
+          error
         )
       );
     }
@@ -84,10 +109,10 @@ export class GitHubCli {
       const jsonBody = JSON.stringify(request.body);
       args.push('--input', '-');
       // Execute command with body piped in
-      return this.executeApi<T>(args, jsonBody, request.signal, request.paginate);
+      return this.executeApi<T>(args, request.host, jsonBody, request.signal, request.paginate);
     }
 
-    return this.executeApi<T>(args, undefined, request.signal, request.paginate);
+    return this.executeApi<T>(args, request.host, undefined, request.signal, request.paginate);
   }
 
   async graphql<T>(request: GitHubGraphqlRequest): Promise<Result<T, GitHubCliError>> {
@@ -104,11 +129,31 @@ export class GitHubCli {
       variables: request.variables,
     });
 
-    return this.executeApi<T>(args, input, request.signal);
+    const result = await this.executeApi<{ data?: T; errors?: unknown[] }>(
+      args,
+      request.host,
+      input,
+      request.signal
+    );
+    if (!result.success) return result;
+    if (result.data.errors?.length) {
+      return err(
+        createCliError(
+          'UNKNOWN_ERROR',
+          'GitHub GraphQL request returned errors',
+          result.data.errors
+        )
+      );
+    }
+    if (!('data' in result.data)) {
+      return err(createCliError('UNKNOWN_ERROR', 'GitHub GraphQL response did not contain data'));
+    }
+    return ok(result.data.data as T);
   }
 
   private async executeApi<T>(
     args: string[],
+    host?: string,
     input?: string,
     signal?: AbortSignal,
     isPaginated?: boolean
@@ -117,6 +162,7 @@ export class GitHubCli {
       const result = await this.execContext.exec('gh', args, {
         signal,
         input,
+        env: this.tokenEnvironment(host),
       });
 
       if (!result.stdout.trim()) {
@@ -130,19 +176,30 @@ export class GitHubCli {
         return ok(parsed.flat() as T);
       }
       return ok(parsed as T);
-    } catch (e: any) {
-      return err(this.mapExecError(e));
+    } catch (error: unknown) {
+      return err(this.mapExecError(error));
     }
   }
 
-  private mapExecError(e: any): GitHubCliError {
-    if (e?.code === 'ENOENT') {
-      return createCliError('CLI_MISSING', 'GitHub CLI (gh) is not installed', e);
+  private tokenEnvironment(host = 'github.com'): NodeJS.ProcessEnv | undefined {
+    const token = this.options.token;
+    if (!token) return undefined;
+    return isGitHubDotComHost(host) ? { GH_TOKEN: token } : { GH_ENTERPRISE_TOKEN: token };
+  }
+
+  private mapExecError(error: unknown): GitHubCliError {
+    const details =
+      error && typeof error === 'object'
+        ? (error as { code?: unknown; message?: unknown; name?: unknown })
+        : {};
+    if (details.code === 'ENOENT') {
+      return createCliError('CLI_MISSING', 'GitHub CLI (gh) is not installed', error);
     }
-    if (e?.message?.includes('timeout') || e?.name === 'AbortError') {
-      return createCliError('TIMEOUT', 'Request timed out or was aborted', e);
+    const message = typeof details.message === 'string' ? details.message : String(error);
+    if (message.includes('timeout') || details.name === 'AbortError') {
+      return createCliError('TIMEOUT', 'Request timed out or was aborted', error);
     }
     // TODO parse stderr for rate limits or network issues
-    return createCliError('UNKNOWN_ERROR', `Command failed: ${e?.message}`, e);
+    return createCliError('UNKNOWN_ERROR', `Command failed: ${message}`, error);
   }
 }

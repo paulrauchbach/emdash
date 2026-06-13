@@ -117,6 +117,46 @@ describe('GitHubCli', () => {
         expect.objectContaining({ input: '{"description":"test"}' })
       );
     });
+
+    it('uses the selected token without changing global gh account state', async () => {
+      const mockExec = vi.fn().mockResolvedValue({ stdout: '{"login":"monalisa"}', stderr: '' });
+      const cli = new GitHubCli(createMockContext(mockExec), { token: 'selected-token' });
+
+      await cli.rest({
+        endpoint: 'user',
+        host: 'github.com',
+      });
+
+      expect(mockExec).toHaveBeenCalledWith(
+        'gh',
+        ['api', 'user', '--hostname', 'github.com'],
+        expect.objectContaining({
+          env: {
+            GH_TOKEN: 'selected-token',
+          },
+        })
+      );
+    });
+
+    it('uses the enterprise token environment variable for enterprise hosts', async () => {
+      const mockExec = vi.fn().mockResolvedValue({ stdout: '{"login":"enterprise"}', stderr: '' });
+      const cli = new GitHubCli(createMockContext(mockExec), { token: 'enterprise-token' });
+
+      await cli.rest({
+        endpoint: 'user',
+        host: 'ghe.example.com',
+      });
+
+      expect(mockExec).toHaveBeenCalledWith(
+        'gh',
+        ['api', 'user', '--hostname', 'ghe.example.com'],
+        expect.objectContaining({
+          env: {
+            GH_ENTERPRISE_TOKEN: 'enterprise-token',
+          },
+        })
+      );
+    });
   });
 
   describe('graphql', () => {
@@ -124,11 +164,12 @@ describe('GitHubCli', () => {
       const mockExec = vi.fn().mockResolvedValue({ stdout: '{"data": {}}', stderr: '' });
       const cli = new GitHubCli(createMockContext(mockExec));
 
-      await cli.graphql({
+      const result = await cli.graphql<{ viewer: { login: string } }>({
         query: 'query { viewer { login } }',
         variables: { limit: 10 },
       });
 
+      expect(result).toEqual({ success: true, data: {} });
       expect(mockExec).toHaveBeenCalledWith(
         'gh',
         ['api', 'graphql', '--input', '-'],
@@ -136,6 +177,23 @@ describe('GitHubCli', () => {
           input: JSON.stringify({ query: 'query { viewer { login } }', variables: { limit: 10 } }),
         })
       );
+    });
+
+    it('unwraps the GraphQL data envelope returned by gh', async () => {
+      const mockExec = vi.fn().mockResolvedValue({
+        stdout: JSON.stringify({ data: { viewer: { login: 'monalisa' } } }),
+        stderr: '',
+      });
+      const cli = new GitHubCli(createMockContext(mockExec));
+
+      await expect(
+        cli.graphql<{ viewer: { login: string } }>({
+          query: 'query { viewer { login } }',
+        })
+      ).resolves.toEqual({
+        success: true,
+        data: { viewer: { login: 'monalisa' } },
+      });
     });
   });
 });

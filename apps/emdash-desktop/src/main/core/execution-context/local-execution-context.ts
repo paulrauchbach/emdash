@@ -10,11 +10,29 @@ import type { ExecOptions, ExecResult, IExecutionContext } from './types';
 
 const execFileAsync = promisify(execFile);
 
-function buildNonInteractiveGitEnv(): NodeJS.ProcessEnv {
-  return {
-    ...process.env,
-    ...NON_INTERACTIVE_GIT_ENV,
-  };
+function buildCommandEnv(command: string, env?: NodeJS.ProcessEnv): NodeJS.ProcessEnv | undefined {
+  if (command !== 'git' && !env) return undefined;
+  return command === 'git'
+    ? { ...process.env, ...env, ...NON_INTERACTIVE_GIT_ENV }
+    : { ...process.env, ...env };
+}
+
+function execFileWithInput(
+  command: string,
+  args: string[],
+  options: Parameters<typeof execFile>[2],
+  input: string | Buffer
+): Promise<ExecResult> {
+  return new Promise((resolve, reject) => {
+    const child = execFile(command, args, options, (error, stdout, stderr) => {
+      if (error) {
+        reject(Object.assign(error, { stdout, stderr }));
+        return;
+      }
+      resolve({ stdout: String(stdout), stderr: String(stderr) });
+    });
+    child.stdin?.end(input);
+  });
 }
 
 export class LocalExecutionContext implements IExecutionContext {
@@ -39,19 +57,26 @@ export class LocalExecutionContext implements IExecutionContext {
 
   exec(command: string, args: string[] = [], opts: ExecOptions = {}): Promise<ExecResult> {
     const { timeout, maxBuffer, input } = opts;
-    return execFileAsync(this.resolveCommand(command), args, {
+    const executable = this.resolveCommand(command);
+    const options = {
       cwd: this.root || undefined,
-      env: command === 'git' ? buildNonInteractiveGitEnv() : undefined,
+      env: buildCommandEnv(command, opts.env),
       timeout,
       maxBuffer,
       signal: this._signal(opts.signal),
-      ...(input !== undefined ? { input } : {}),
-    }).catch((error) => {
+      encoding: 'utf8' as const,
+    };
+    const execution =
+      input === undefined
+        ? (execFileAsync(executable, args, options) as Promise<ExecResult>)
+        : execFileWithInput(executable, args, options, input);
+
+    return execution.catch((error) => {
       if (command === 'git' && isMissingGitExecutableError(error)) {
         throw missingGitExecutableError();
       }
       throw error;
-    }) as Promise<ExecResult>;
+    });
   }
 
   execStreaming(
@@ -70,7 +95,7 @@ export class LocalExecutionContext implements IExecutionContext {
 
       const child = spawn(this.resolveCommand(command), args, {
         cwd: this.root || undefined,
-        env: command === 'git' ? buildNonInteractiveGitEnv() : undefined,
+        env: buildCommandEnv(command),
       });
 
       let settled = false;

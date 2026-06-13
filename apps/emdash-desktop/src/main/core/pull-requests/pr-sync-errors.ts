@@ -1,4 +1,4 @@
-import type { GitHubCliError } from '@main/core/github/cli/github-cli-errors';
+import { isGitHubCliError, type GitHubCliError } from '@main/core/github/cli/github-cli-errors';
 import type { GitHubApiAuthError } from '@main/core/github/services/github-api-auth-errors';
 import {
   classifyGitHubApiError,
@@ -54,8 +54,8 @@ export function toPrApiError(
       return error as PrSyncEngineError;
     }
     // Check if it's a GitHubCliError
-    if ('code' in error && 'message' in error && typeof (error as any).code === 'string') {
-      return mapCliErrorToPrError(error as any, host ?? 'github.com');
+    if (isGitHubCliError(error)) {
+      return mapCliErrorToPrError(error, host ?? 'github.com');
     }
   }
   return classifyGitHubApiError(error, { host, nameWithOwner, fallback });

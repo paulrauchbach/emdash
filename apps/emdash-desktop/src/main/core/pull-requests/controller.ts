@@ -14,7 +14,10 @@ import { isGitHubDotComHost, parseRepositoryRef } from '@shared/repository-ref';
 import { prQueryService } from './pr-query-service';
 import { prSyncEngine } from './pr-sync-engine';
 import { type PrSyncEngineError } from './pr-sync-errors';
-import { resolveProjectPullRequestContext } from './project-pull-request-context';
+import {
+  resolveProjectPullRequestAuthContext,
+  resolveProjectPullRequestContext,
+} from './project-pull-request-context';
 const { tasks, workspaces } = await import('@main/db/schema');
 const { eq } = await import('drizzle-orm');
 const { db } = await import('@main/db/client');
@@ -196,7 +199,10 @@ export const pullRequestController = createRPCController({
       const context = await resolveProjectPullRequestContext(projectId);
       if (!context.success) return err(context.error);
 
-      const result = await prSyncEngine.forceFullSync(context.data.repositoryUrl);
+      const result = await prSyncEngine.forceFullSync(
+        context.data.repositoryUrl,
+        context.data.authContext
+      );
       if (!result.success) {
         return err<PullRequestError>(mapPrSyncEngineError(result.error, 'sync_failed'));
       }
@@ -226,7 +232,7 @@ export const pullRequestController = createRPCController({
         projectId,
         repositoryUrl: context.data.repositoryUrl,
       });
-      const result = await prSyncEngine.sync(context.data.repositoryUrl);
+      const result = await prSyncEngine.sync(context.data.repositoryUrl, context.data.authContext);
       if (!result.success) {
         return err<PullRequestError>(mapPrSyncEngineError(result.error, 'sync_failed'));
       }
@@ -242,7 +248,10 @@ export const pullRequestController = createRPCController({
 
   refreshPullRequest: async (projectId: string, repositoryUrl: string, prNumber: number) => {
     try {
-      const result = await prSyncEngine.syncSingle(repositoryUrl, prNumber);
+      const authContext = await resolveProjectPullRequestAuthContext(projectId);
+      if (!authContext.success) return err(authContext.error);
+
+      const result = await prSyncEngine.syncSingle(repositoryUrl, prNumber, authContext.data);
       if (!result.success) {
         return err<PullRequestError>(mapPrSyncEngineError(result.error, 'refresh_failed'));
       }
@@ -258,7 +267,10 @@ export const pullRequestController = createRPCController({
 
   syncChecks: async (projectId: string, pullRequestUrl: string, headRefOid: string) => {
     try {
-      const result = await prSyncEngine.syncChecks(pullRequestUrl, headRefOid);
+      const authContext = await resolveProjectPullRequestAuthContext(projectId);
+      if (!authContext.success) return err(authContext.error);
+
+      const result = await prSyncEngine.syncChecks(pullRequestUrl, headRefOid, authContext.data);
       if (!result.success) {
         return err<PullRequestError>(mapPrSyncEngineError(result.error, 'checks_failed'));
       }
@@ -293,7 +305,10 @@ export const pullRequestController = createRPCController({
         }
       }
 
-      const result = await prSyncEngine.createPullRequest(params);
+      const authContext = await resolveProjectPullRequestAuthContext(projectId);
+      if (!authContext.success) return err(authContext.error);
+
+      const result = await prSyncEngine.createPullRequest(params, authContext.data);
       if (!result.success) {
         telemetryService.capture('pr_creation_failed', {
           error_type: result.error.type,
@@ -301,7 +316,7 @@ export const pullRequestController = createRPCController({
         return err<PullRequestError>(mapPrSyncEngineError(result.error, 'create_failed'));
       }
       // Sync the newly created PR into the DB
-      void prSyncEngine.syncSingle(params.repositoryUrl, result.data.number);
+      void prSyncEngine.syncSingle(params.repositoryUrl, result.data.number, authContext.data);
       telemetryService.capture('pr_created', { is_draft: params.draft });
       return ok({ url: result.data.url, number: result.data.number });
     } catch (error) {
@@ -321,12 +336,20 @@ export const pullRequestController = createRPCController({
     options: PullRequestMergeOptions
   ) => {
     try {
-      const result = await prSyncEngine.mergePullRequest(repositoryUrl, prNumber, options);
+      const authContext = await resolveProjectPullRequestAuthContext(projectId);
+      if (!authContext.success) return err(authContext.error);
+
+      const result = await prSyncEngine.mergePullRequest(
+        repositoryUrl,
+        prNumber,
+        options,
+        authContext.data
+      );
       if (!result.success) {
         return err<PullRequestError>(mapPrSyncEngineError(result.error, 'merge_failed'));
       }
       // Refresh the merged PR
-      void prSyncEngine.syncSingle(repositoryUrl, prNumber);
+      void prSyncEngine.syncSingle(repositoryUrl, prNumber, authContext.data);
       return ok({ sha: result.data.sha, merged: result.data.merged });
     } catch (error) {
       log.error('Failed to merge pull request:', error);
@@ -339,11 +362,18 @@ export const pullRequestController = createRPCController({
 
   markReadyForReview: async (projectId: string, repositoryUrl: string, prNumber: number) => {
     try {
-      const result = await prSyncEngine.markReadyForReview(repositoryUrl, prNumber);
+      const authContext = await resolveProjectPullRequestAuthContext(projectId);
+      if (!authContext.success) return err(authContext.error);
+
+      const result = await prSyncEngine.markReadyForReview(
+        repositoryUrl,
+        prNumber,
+        authContext.data
+      );
       if (!result.success) {
         return err<PullRequestError>(mapPrSyncEngineError(result.error, 'mark_ready_failed'));
       }
-      void prSyncEngine.syncSingle(repositoryUrl, prNumber);
+      void prSyncEngine.syncSingle(repositoryUrl, prNumber, authContext.data);
       return ok();
     } catch (error) {
       log.error('Failed to mark pull request ready for review:', error);
@@ -358,7 +388,14 @@ export const pullRequestController = createRPCController({
 
   getPullRequestFiles: async (projectId: string, repositoryUrl: string, prNumber: number) => {
     try {
-      const result = await prSyncEngine.getPullRequestFiles(repositoryUrl, prNumber);
+      const authContext = await resolveProjectPullRequestAuthContext(projectId);
+      if (!authContext.success) return err(authContext.error);
+
+      const result = await prSyncEngine.getPullRequestFiles(
+        repositoryUrl,
+        prNumber,
+        authContext.data
+      );
       if (!result.success) {
         return err<PullRequestError>(mapPrSyncEngineError(result.error, 'files_failed'));
       }
@@ -375,7 +412,14 @@ export const pullRequestController = createRPCController({
 
   getPullRequestComments: async (projectId: string, repositoryUrl: string, prNumber: number) => {
     try {
-      const result = await prSyncEngine.getPullRequestComments(repositoryUrl, prNumber);
+      const authContext = await resolveProjectPullRequestAuthContext(projectId);
+      if (!authContext.success) return err(authContext.error);
+
+      const result = await prSyncEngine.getPullRequestComments(
+        repositoryUrl,
+        prNumber,
+        authContext.data
+      );
       if (!result.success) {
         return err<PullRequestError>(mapPrSyncEngineError(result.error, 'comments_failed'));
       }

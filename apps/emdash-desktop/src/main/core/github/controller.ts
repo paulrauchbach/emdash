@@ -8,7 +8,6 @@ import { cloneRepository, initializeNewProject } from '@main/core/git/impl/git-r
 import { githubAccountService } from '@main/core/github/accounts/github-account-service-instance';
 import { repoService } from '@main/core/github/services/repo-service';
 import { sshConnectionManager } from '@main/core/ssh/lifecycle/production-ssh-connection-manager';
-import { events } from '@main/lib/events';
 import { log } from '@main/lib/logger';
 import { telemetryService } from '@main/lib/telemetry';
 import type {
@@ -80,21 +79,11 @@ export const githubController = createRPCController({
     }
   },
 
-  authCancel: async () => {
-    try {
-      githubDeviceFlowService.cancel();
-      return { success: true };
-    } catch (error) {
-      log.error('Failed to cancel GitHub auth:', error);
-      return { success: false, error: 'Failed to cancel' };
-    }
-  },
-
   // -- Repositories --------------------------------------------------------
 
   getRepositories: async (accountId?: string) => {
     try {
-      return await repoService.listRepositories();
+      return await repoService.listRepositories({ accountId });
     } catch (error) {
       log.error('Failed to get repositories:', error);
       return [];
@@ -103,7 +92,7 @@ export const githubController = createRPCController({
 
   getOwners: async (accountId?: string) => {
     try {
-      const owners = await repoService.getOwners();
+      const owners = await repoService.getOwners({ accountId });
       return { success: true, owners };
     } catch (error) {
       log.error('Failed to get owners:', error);
@@ -129,6 +118,7 @@ export const githubController = createRPCController({
         owner: params.owner,
         description: params.description,
         isPrivate,
+        authContext: { accountId: params.accountId ?? undefined },
       });
       return {
         success: true,
@@ -148,7 +138,9 @@ export const githubController = createRPCController({
 
   deleteRepository: async (params: { owner: string; name: string; accountId?: string | null }) => {
     try {
-      await repoService.deleteRepository(params.owner, params.name);
+      await repoService.deleteRepository(params.owner, params.name, {
+        accountId: params.accountId ?? undefined,
+      });
       return { success: true };
     } catch (error) {
       log.error('Failed to delete repository:', error);

@@ -1,5 +1,8 @@
-import { LocalExecutionContext } from '@main/core/execution-context/local-execution-context';
-import { GitHubCli } from '../cli/github-cli';
+import type { Result } from '@shared/lib/result';
+import type { GitHubCli } from '../cli/github-cli';
+import { getGitHubCli } from '../cli/github-cli-provider';
+import type { GitHubApiAuthError } from './github-api-auth-errors';
+import type { GitHubApiAuthContext } from './github-api-auth-service';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -27,15 +30,16 @@ export interface GitHubOwner {
 }
 
 export interface GitHubRepositoryService {
-  listRepositories(): Promise<GitHubRepo[]>;
-  getOwners(): Promise<GitHubOwner[]>;
+  listRepositories(authContext?: GitHubApiAuthContext): Promise<GitHubRepo[]>;
+  getOwners(authContext?: GitHubApiAuthContext): Promise<GitHubOwner[]>;
   createRepository(params: {
     name: string;
     description?: string;
     owner: string;
     isPrivate: boolean;
+    authContext?: GitHubApiAuthContext;
   }): Promise<{ url: string; cloneUrl: string; defaultBranch: string; nameWithOwner: string }>;
-  deleteRepository(owner: string, name: string): Promise<void>;
+  deleteRepository(owner: string, name: string, authContext?: GitHubApiAuthContext): Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -63,13 +67,19 @@ interface RestRepo {
 // ---------------------------------------------------------------------------
 
 export class GitHubRepositoryServiceImpl implements GitHubRepositoryService {
-  constructor(private readonly getCli: () => GitHubCli) {}
+  constructor(
+    private readonly getCli: (
+      host: string,
+      authContext?: GitHubApiAuthContext
+    ) => Promise<Result<GitHubCli, GitHubApiAuthError>>
+  ) {}
 
-  async listRepositories(): Promise<GitHubRepo[]> {
-    const cli = this.getCli();
+  async listRepositories(authContext: GitHubApiAuthContext = {}): Promise<GitHubRepo[]> {
+    const { cli, host } = await this.resolveCli(authContext);
     const result = await cli.rest<RestRepo[]>({
       endpoint: 'user/repos',
       paginate: true,
+      host,
     });
     if (!result.success) {
       throw new Error(result.error.message);
@@ -77,10 +87,11 @@ export class GitHubRepositoryServiceImpl implements GitHubRepositoryService {
     return result.data.map((item) => this.mapRepo(item));
   }
 
-  async getOwners(): Promise<GitHubOwner[]> {
-    const cli = this.getCli();
+  async getOwners(authContext: GitHubApiAuthContext = {}): Promise<GitHubOwner[]> {
+    const { cli, host } = await this.resolveCli(authContext);
     const userResult = await cli.rest<{ login: string }>({
       endpoint: 'user',
+      host,
     });
     if (!userResult.success) {
       throw new Error(userResult.error.message);
@@ -91,6 +102,7 @@ export class GitHubRepositoryServiceImpl implements GitHubRepositoryService {
       const orgsResult = await cli.rest<{ login: string }[]>({
         endpoint: 'user/orgs',
         paginate: true,
+        host,
       });
       if (orgsResult.success) {
         for (const org of orgsResult.data) {
@@ -107,10 +119,12 @@ export class GitHubRepositoryServiceImpl implements GitHubRepositoryService {
     description?: string;
     owner: string;
     isPrivate: boolean;
+    authContext?: GitHubApiAuthContext;
   }): Promise<{ url: string; cloneUrl: string; defaultBranch: string; nameWithOwner: string }> {
-    const cli = this.getCli();
+    const { cli, host } = await this.resolveCli(params.authContext ?? {});
     const userResult = await cli.rest<{ login: string }>({
       endpoint: 'user',
+      host,
     });
     if (!userResult.success) {
       throw new Error(userResult.error.message);
@@ -127,6 +141,7 @@ export class GitHubRepositoryServiceImpl implements GitHubRepositoryService {
       endpoint: isCurrentUser ? 'user/repos' : `orgs/${params.owner}/repos`,
       method: 'POST',
       body: createParams,
+      host,
     });
 
     if (!result.success) {
@@ -143,15 +158,35 @@ export class GitHubRepositoryServiceImpl implements GitHubRepositoryService {
     };
   }
 
-  async deleteRepository(owner: string, name: string): Promise<void> {
-    const cli = this.getCli();
+  async deleteRepository(
+    owner: string,
+    name: string,
+    authContext: GitHubApiAuthContext = {}
+  ): Promise<void> {
+    const { cli, host } = await this.resolveCli(authContext);
     const result = await cli.rest({
       endpoint: `repos/${owner}/${name}`,
       method: 'DELETE',
+      host,
     });
     if (!result.success) {
       throw new Error(result.error.message);
     }
+  }
+
+  private async resolveCli(
+    authContext: GitHubApiAuthContext
+  ): Promise<{ cli: GitHubCli; host: string }> {
+    const host = this.hostForAuthContext(authContext);
+    const cli = await this.getCli(host, authContext);
+    if (!cli.success) throw new Error(cli.error.message);
+    return { cli: cli.data, host };
+  }
+
+  private hostForAuthContext(authContext: GitHubApiAuthContext): string {
+    const accountId = authContext.accountId?.trim();
+    if (!accountId) return 'github.com';
+    return accountId.split(':')[0] || 'github.com';
   }
 
   private mapRepo(item: RestRepo): GitHubRepo {
@@ -173,6 +208,4 @@ export class GitHubRepositoryServiceImpl implements GitHubRepositoryService {
   }
 }
 
-export const repoService = new GitHubRepositoryServiceImpl(() => {
-  return new GitHubCli(new LocalExecutionContext({ root: process.cwd() }));
-});
+export const repoService = new GitHubRepositoryServiceImpl(getGitHubCli);

@@ -8,6 +8,7 @@ export interface ExecOptions {
   maxBuffer?: number;
   signal?: AbortSignal;
   input?: string | Buffer;
+  env?: NodeJS.ProcessEnv;
 }
 
 /**

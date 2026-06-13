@@ -1,9 +1,11 @@
-import { LocalExecutionContext } from '@main/core/execution-context/local-execution-context';
 import type { IssueListError } from '@shared/issue-providers';
 import { err, ok, type Result } from '@shared/lib/result';
 import type { RepositoryRef } from '@shared/repository-ref';
-import { GitHubCli } from '../cli/github-cli';
+import type { GitHubCli } from '../cli/github-cli';
 import { type GitHubCliError } from '../cli/github-cli-errors';
+import { getGitHubCli } from '../cli/github-cli-provider';
+import type { GitHubApiAuthError } from './github-api-auth-errors';
+import type { GitHubApiAuthContext } from './github-api-auth-service';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -28,16 +30,19 @@ export type GitHubIssueDetail = GitHubIssue;
 export interface GitHubIssueService {
   listIssues(
     repository: RepositoryRef,
-    limit?: number
+    limit?: number,
+    authContext?: GitHubApiAuthContext
   ): Promise<Result<GitHubIssue[], IssueListError>>;
   searchIssues(
     repository: RepositoryRef,
     searchTerm: string,
-    limit?: number
+    limit?: number,
+    authContext?: GitHubApiAuthContext
   ): Promise<Result<GitHubIssue[], IssueListError>>;
   getIssue(
     repository: RepositoryRef,
-    issueNumber: number
+    issueNumber: number,
+    authContext?: GitHubApiAuthContext
   ): Promise<Result<GitHubIssueDetail | null, IssueListError>>;
 }
 
@@ -65,62 +70,75 @@ interface RestIssue {
 // ---------------------------------------------------------------------------
 
 export class GitHubIssueServiceImpl implements GitHubIssueService {
-  constructor(private readonly getCli: () => GitHubCli) {}
+  constructor(
+    private readonly getCli: (
+      host: string,
+      authContext?: GitHubApiAuthContext
+    ) => Promise<Result<GitHubCli, GitHubApiAuthError>>
+  ) {}
 
   async listIssues(
     repository: RepositoryRef,
-    limit: number = 50
+    limit: number = 50,
+    authContext: GitHubApiAuthContext = {}
   ): Promise<Result<GitHubIssue[], IssueListError>> {
     const { owner, repo, host } = repository;
-    const cli = this.getCli();
+    const cli = await this.getCli(host, authContext);
+    if (!cli.success) return err(this.mapAuthError(cli.error));
 
-    const result = await cli.rest<RestIssue[]>({
+    const result = await cli.data.rest<RestIssue[]>({
       endpoint: `repos/${owner}/${repo}/issues?state=open&per_page=${Math.min(Math.max(limit, 1), 100)}&sort=updated&direction=desc`,
       host,
-      paginate: true,
     });
 
-    if (!result.success) return err(this.mapApiError(result.error));
+    if (!result.success) return err(this.mapApiError(result.error, repository));
 
     return ok(
-      result.data.filter((issue) => !issue.pull_request).map((item) => this.mapIssue(item))
+      result.data
+        .filter((issue) => !issue.pull_request)
+        .slice(0, Math.max(limit, 0))
+        .map((item) => this.mapIssue(item))
     );
   }
 
   async searchIssues(
     repository: RepositoryRef,
     searchTerm: string,
-    limit: number = 20
+    limit: number = 20,
+    authContext: GitHubApiAuthContext = {}
   ): Promise<Result<GitHubIssue[], IssueListError>> {
     const term = searchTerm.trim();
     if (!term) return ok([]);
     const { owner, repo, host } = repository;
-    const cli = this.getCli();
+    const cli = await this.getCli(host, authContext);
+    if (!cli.success) return err(this.mapAuthError(cli.error));
 
     const q = encodeURIComponent(`${term} repo:${owner}/${repo} is:issue is:open`);
-    const result = await cli.rest<{ items: RestIssue[] }>({
+    const result = await cli.data.rest<{ items: RestIssue[] }>({
       endpoint: `search/issues?q=${q}&per_page=${Math.min(Math.max(limit, 1), 100)}&sort=updated&order=desc`,
       host,
     });
 
-    if (!result.success) return err(this.mapApiError(result.error));
+    if (!result.success) return err(this.mapApiError(result.error, repository));
 
     return ok(result.data.items.map((item) => this.mapIssue(item)));
   }
 
   async getIssue(
     repository: RepositoryRef,
-    issueNumber: number
+    issueNumber: number,
+    authContext: GitHubApiAuthContext = {}
   ): Promise<Result<GitHubIssueDetail | null, IssueListError>> {
     const { owner, repo, host } = repository;
-    const cli = this.getCli();
+    const cli = await this.getCli(host, authContext);
+    if (!cli.success) return err(this.mapAuthError(cli.error));
 
-    const result = await cli.rest<RestIssue>({
+    const result = await cli.data.rest<RestIssue>({
       endpoint: `repos/${owner}/${repo}/issues/${issueNumber}`,
       host,
     });
 
-    if (!result.success) return err(this.mapApiError(result.error));
+    if (!result.success) return err(this.mapApiError(result.error, repository));
 
     return ok(this.mapIssue(result.data));
   }
@@ -145,29 +163,68 @@ export class GitHubIssueServiceImpl implements GitHubIssueService {
     };
   }
 
-  private mapApiError(error: GitHubCliError): IssueListError {
+  private mapAuthError(error: GitHubApiAuthError): IssueListError {
+    switch (error.type) {
+      case 'auth_required':
+        return { type: 'auth_required', host: error.host, message: error.message };
+      case 'account_not_found':
+        return {
+          type: 'account_not_found',
+          host: error.host,
+          accountId: error.accountId,
+          message: error.message,
+        };
+      case 'account_host_mismatch':
+        return {
+          type: 'account_host_mismatch',
+          host: error.host,
+          accountId: error.accountId,
+          accountHost: error.accountHost,
+          message: error.message,
+        };
+      case 'token_missing':
+        return {
+          type: 'token_missing',
+          host: error.host,
+          accountId: error.accountId,
+          message: error.message,
+        };
+    }
+  }
+
+  private mapApiError(error: GitHubCliError, repository: RepositoryRef): IssueListError {
     switch (error.code) {
       case 'NOT_AUTHENTICATED':
+        return { type: 'auth_required', host: repository.host, message: error.message };
       case 'SSO_REQUIRED':
-        return { type: 'auth_required', host: '', message: error.message };
+        return { type: 'sso_required', host: repository.host, message: error.message };
+      case 'RATE_LIMITED':
+        return { type: 'rate_limited', host: repository.host, message: error.message };
+      case 'NETWORK_ERROR':
+      case 'TIMEOUT':
+        return {
+          type: 'host_unreachable',
+          host: repository.host,
+          message: error.message,
+        };
       case 'UNKNOWN_ERROR':
         if (error.message.includes('rate limit')) {
-          return { type: 'rate_limited', host: '', message: error.message };
+          return { type: 'rate_limited', host: repository.host, message: error.message };
         }
         if (error.message.includes('Not Found') || error.message.includes('404')) {
-          return { type: 'not_found_or_no_access', host: '', message: error.message };
+          return {
+            type: 'not_found_or_no_access',
+            host: repository.host,
+            message: error.message,
+          };
         }
         return { type: 'generic', message: error.message };
       case 'CLI_MISSING':
         return { type: 'generic', message: 'GitHub CLI not installed.' };
-      case 'TIMEOUT':
-        return { type: 'generic', message: 'Request timed out.' };
       default:
         return { type: 'generic', message: error.message };
     }
   }
 }
 
-export const issueService = new GitHubIssueServiceImpl(() => {
-  return new GitHubCli(new LocalExecutionContext({ root: process.cwd() }));
-});
+export const issueService = new GitHubIssueServiceImpl(getGitHubCli);

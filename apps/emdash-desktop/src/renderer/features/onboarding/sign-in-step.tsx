@@ -1,4 +1,4 @@
-import { AlertCircle, CheckCircle, Github, LogIn, User, Terminal } from 'lucide-react';
+import { AlertCircle, CheckCircle, Github, LogIn, Terminal } from 'lucide-react';
 import { useRef, useState } from 'react';
 import {
   useImportGitHubCliAccounts,
