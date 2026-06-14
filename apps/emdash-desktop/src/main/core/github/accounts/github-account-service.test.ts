@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it } from 'vitest';
 import {
   GitHubAccountRegistry,
   type GitHubAccount,
@@ -59,19 +59,13 @@ describe('GitHubAccountService', () => {
   let registry: GitHubAccountRegistry;
   let service: GitHubAccountService;
   let importCliAccounts: () => Promise<GitHubAccount[]>;
-  let clearOctokitCache: (host?: string, accountId?: string) => void;
 
   beforeEach(() => {
     registry = new GitHubAccountRegistry(new InMemoryMetadataStore(), new InMemorySecretStore());
     importCliAccounts = async () => [];
-    clearOctokitCache = vi.fn();
-    service = new GitHubAccountService(
-      registry,
-      {
-        importAccounts: () => importCliAccounts(),
-      },
-      clearOctokitCache
-    );
+    service = new GitHubAccountService(registry, {
+      importAccounts: () => importCliAccounts(),
+    });
   });
 
   async function upsertAccount(login: string, providerAccountId: string, host = 'github.com') {
@@ -166,7 +160,6 @@ describe('GitHubAccountService', () => {
 
     expect(accounts).toMatchObject([{ accountId: first.id, isDefault: true }]);
     await expect(registry.resolveToken(second.id)).resolves.toBeNull();
-    expect(clearOctokitCache).toHaveBeenCalledWith('github.com', second.id);
   });
 
   it('returns null when removing an unknown account id', async () => {

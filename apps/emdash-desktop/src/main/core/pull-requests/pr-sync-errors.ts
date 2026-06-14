@@ -1,3 +1,4 @@
+import { isGitHubCliError, type GitHubCliError } from '@main/core/github/cli/github-cli-errors';
 import type { GitHubApiAuthError } from '@main/core/github/services/github-api-auth-errors';
 import {
   classifyGitHubApiError,
@@ -32,7 +33,9 @@ export type PrSyncEngineError =
   | GitHubApiAuthError
   | GitHubApiOperationError
   | PrSyncCancelledError
-  | PrSyncApiError;
+  | PrSyncApiError
+  | PrSyncHostUnreachableError
+  | PrSyncNotFoundOrNoAccessError;
 
 export function isPrSyncHostUnreachable(
   error: PrSyncEngineError
@@ -46,7 +49,45 @@ export function toPrApiError(
   host?: string,
   nameWithOwner?: string
 ): PrSyncEngineError {
+  if (error && typeof error === 'object') {
+    if ('type' in error && 'message' in error) {
+      return error as PrSyncEngineError;
+    }
+    // Check if it's a GitHubCliError
+    if (isGitHubCliError(error)) {
+      return mapCliErrorToPrError(error, host ?? 'github.com');
+    }
+  }
   return classifyGitHubApiError(error, { host, nameWithOwner, fallback });
+}
+
+export function mapCliErrorToPrError(error: GitHubCliError, host: string): PrSyncEngineError {
+  switch (error.code) {
+    case 'NOT_AUTHENTICATED':
+      return { type: 'auth_required', host, message: error.message };
+    case 'SSO_REQUIRED':
+      return {
+        type: 'sso_required',
+        host,
+        message: error.message,
+        status: 403,
+      } as PrSyncEngineError;
+    case 'RATE_LIMITED':
+      return {
+        type: 'rate_limited',
+        host,
+        message: error.message,
+        status: 403,
+      } as PrSyncEngineError;
+    case 'NETWORK_ERROR':
+    case 'TIMEOUT':
+      return { type: 'host_unreachable', host, reason: error.message };
+    default:
+      if (error.message.includes('404') || error.message.includes('Not Found')) {
+        return { type: 'not_found_or_no_access', host, message: error.message };
+      }
+      return { type: 'api_error', message: error.message };
+  }
 }
 
 export function prSyncEngineErrorMessage(error: PrSyncEngineError): string {

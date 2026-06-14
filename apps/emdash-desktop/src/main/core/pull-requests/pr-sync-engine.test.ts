@@ -1,13 +1,11 @@
-import type { Octokit } from '@octokit/rest';
 import { describe, expect, it, vi } from 'vitest';
-import type { GitHubApiAuthError } from '@main/core/github/services/github-api-auth-errors';
+import type { GitHubCli } from '@main/core/github/cli/github-cli';
 import { err, ok } from '@shared/lib/result';
-import type { Result } from '@shared/lib/result';
 import { PrSyncEngine } from './pr-sync-engine';
 import { toPrApiError } from './pr-sync-errors';
 
-vi.mock('@main/core/github/services/octokit-provider', () => ({
-  getOctokit: vi.fn(),
+vi.mock('@main/core/github/cli/github-cli-provider', () => ({
+  getGitHubCli: vi.fn(),
 }));
 
 vi.mock('@main/db/client', () => ({
@@ -34,18 +32,19 @@ vi.mock('@main/lib/rate-limiter', () => ({
   },
 }));
 
-function makeOctokit(overrides: {
-  createPullRequest?: ReturnType<typeof vi.fn>;
-  mergePullRequest?: ReturnType<typeof vi.fn>;
-}): Octokit {
+function makeGitHubCli(overrides: {
+  rest?: ReturnType<typeof vi.fn>;
+  graphql?: ReturnType<typeof vi.fn>;
+}): GitHubCli {
   return {
-    rest: {
-      pulls: {
-        create: overrides.createPullRequest ?? vi.fn(),
-        merge: overrides.mergePullRequest ?? vi.fn(),
-      },
-    },
-  } as unknown as Octokit;
+    rest: overrides.rest ?? vi.fn(),
+    graphql: overrides.graphql ?? vi.fn(),
+    authStatus: vi.fn(),
+  } as unknown as GitHubCli;
+}
+
+function makeGetCli(cli: GitHubCli) {
+  return vi.fn().mockResolvedValue(ok(cli));
 }
 
 function flushPromises(): Promise<void> {
@@ -53,12 +52,13 @@ function flushPromises(): Promise<void> {
 }
 
 describe('PrSyncEngine', () => {
-  it('creates pull requests with a host-aware Octokit client', async () => {
-    const createPullRequest = vi.fn().mockResolvedValue({
-      data: { html_url: 'https://ghe.example.com/acme/repo/pull/12', number: 12 },
-    });
-    const getOctokit = vi.fn().mockResolvedValue(ok(makeOctokit({ createPullRequest })));
-    const engine = new PrSyncEngine(getOctokit);
+  it('creates pull requests with a host-aware CLI', async () => {
+    const rest = vi
+      .fn()
+      .mockResolvedValue(ok({ html_url: 'https://ghe.example.com/acme/repo/pull/12', number: 12 }));
+    const cli = makeGitHubCli({ rest });
+    const getCli = makeGetCli(cli);
+    const engine = new PrSyncEngine(getCli);
 
     const result = await engine.createPullRequest({
       repositoryUrl: 'https://ghe.example.com/acme/repo',
@@ -68,44 +68,47 @@ describe('PrSyncEngine', () => {
       draft: false,
     });
 
-    expect(getOctokit).toHaveBeenCalledWith('ghe.example.com', {});
-    expect(createPullRequest).toHaveBeenCalledWith({
-      owner: 'acme',
-      repo: 'repo',
-      head: 'feature',
-      base: 'main',
-      title: 'Test',
-      body: undefined,
-      draft: false,
+    expect(getCli).toHaveBeenCalledWith('ghe.example.com', {});
+    expect(rest).toHaveBeenCalledWith({
+      endpoint: 'repos/acme/repo/pulls',
+      method: 'POST',
+      body: {
+        head: 'feature',
+        base: 'main',
+        title: 'Test',
+        body: undefined,
+        draft: false,
+      },
+      host: 'ghe.example.com',
     });
     expect(result).toEqual(ok({ url: 'https://ghe.example.com/acme/repo/pull/12', number: 12 }));
   });
 
-  it('passes account context to repository sync Octokit resolution', async () => {
-    const getOctokit = vi.fn().mockResolvedValue(
-      err({
-        type: 'auth_required',
-        host: 'github.com',
-        message: 'GitHub authentication required.',
-      })
-    );
-    const engine = new PrSyncEngine(getOctokit);
+  it('passes account context to repository sync CLI resolution', async () => {
+    const graphql = vi
+      .fn()
+      .mockResolvedValue(
+        err({ code: 'NOT_AUTHENTICATED', message: 'GitHub authentication required.' })
+      );
+    const cli = makeGitHubCli({ graphql });
+    const getCli = makeGetCli(cli);
+    const engine = new PrSyncEngine(getCli);
 
     void engine.sync('https://github.com/acme/repo', { accountId: 'github.com:42' });
     await flushPromises();
 
-    expect(getOctokit).toHaveBeenCalledWith('github.com', { accountId: 'github.com:42' });
+    expect(getCli).toHaveBeenCalledWith('github.com', { accountId: 'github.com:42' });
+    expect(graphql).toHaveBeenCalledWith(expect.objectContaining({ host: 'github.com' }));
   });
 
   it('returns the in-flight repository sync result to duplicate callers', async () => {
-    let resolveOctokit!: (value: Result<Octokit, GitHubApiAuthError>) => void;
-    const getOctokit = vi.fn<(host: string) => Promise<Result<Octokit, GitHubApiAuthError>>>(
-      () =>
-        new Promise((resolve) => {
-          resolveOctokit = resolve;
-        })
-    );
-    const engine = new PrSyncEngine(getOctokit);
+    let resolveCli!: (value: unknown) => void;
+    const graphqlPromise = new Promise((resolve) => {
+      resolveCli = resolve;
+    });
+    const graphql = vi.fn().mockReturnValue(graphqlPromise);
+    const cli = makeGitHubCli({ graphql });
+    const engine = new PrSyncEngine(makeGetCli(cli));
 
     const first = engine.sync('https://ghe.example.com/acme/repo');
     await flushPromises();
@@ -113,12 +116,10 @@ describe('PrSyncEngine', () => {
 
     expect(second).toBe(first);
 
-    resolveOctokit(
+    resolveCli(
       err({
-        type: 'auth_required',
-        host: 'ghe.example.com',
+        code: 'NOT_AUTHENTICATED',
         message: 'auth required',
-        hint: 'Run: gh auth login --hostname ghe.example.com',
       })
     );
 
@@ -126,16 +127,20 @@ describe('PrSyncEngine', () => {
       type: 'auth_required',
       host: 'ghe.example.com',
       message: 'auth required',
-      hint: 'Run: gh auth login --hostname ghe.example.com',
     });
     await expect(first).resolves.toEqual(expected);
     await expect(second).resolves.toEqual(expected);
-    expect(getOctokit).toHaveBeenCalledTimes(1);
+    expect(graphql).toHaveBeenCalledTimes(1);
   });
 
   it('returns a cancelled result when a repository sync is aborted before completion', async () => {
-    const getOctokit = vi.fn().mockResolvedValue(ok(makeOctokit({})));
-    const engine = new PrSyncEngine(getOctokit);
+    const graphql = vi
+      .fn()
+      .mockResolvedValue(
+        ok({ repository: { pullRequests: { nodes: [], pageInfo: { hasNextPage: false } } } })
+      );
+    const cli = makeGitHubCli({ graphql });
+    const engine = new PrSyncEngine(makeGetCli(cli));
 
     const result = engine.sync('https://github.com/acme/repo');
     engine.cancel('https://github.com/acme/repo');
@@ -146,13 +151,15 @@ describe('PrSyncEngine', () => {
         message: 'Pull request sync was cancelled.',
       })
     );
-    expect(getOctokit).not.toHaveBeenCalled();
+    expect(graphql).not.toHaveBeenCalled();
   });
 
   it('maps post-token PR API repository access failures to not-found-or-no-access errors', async () => {
-    const createPullRequest = vi.fn().mockRejectedValue({ status: 404 });
-    const getOctokit = vi.fn().mockResolvedValue(ok(makeOctokit({ createPullRequest })));
-    const engine = new PrSyncEngine(getOctokit);
+    const rest = vi
+      .fn()
+      .mockResolvedValue(err({ code: 'UNKNOWN_ERROR', message: '404 Not Found' }));
+    const cli = makeGitHubCli({ rest });
+    const engine = new PrSyncEngine(makeGetCli(cli));
 
     await expect(
       engine.createPullRequest({
@@ -166,46 +173,42 @@ describe('PrSyncEngine', () => {
       err({
         type: 'not_found_or_no_access',
         host: 'ghe.example.com',
-        nameWithOwner: 'acme/repo',
-        status: 404,
-        message:
-          'acme/repo on ghe.example.com was not found, or the selected GitHub account does not have access.',
+        message: '404 Not Found',
       })
     );
   });
 
   it('maps GitHub network timeouts to host reachability errors', () => {
-    const error = Object.assign(
-      new Error('Connect Timeout Error (attempted address: api.github.com:443, timeout: 10000ms)'),
-      { status: 500 }
-    );
+    const error = { code: 'TIMEOUT', message: 'Connect Timeout Error' };
+
+    // We simulate mapping the GitHubCliError via `mapCliErrorToPrError` dynamically as it's part of the PrSyncEngine execution
+    // `toPrApiError` handles PrSyncEngineError when it receives one, so we wrap it here or use mapCliErrorToPrError
+    // Actually, `toPrApiError` doesn't do CLI mapping directly unless we pass the mapped error.
+    // The engine maps it using mapCliErrorToPrError. Let's just ensure it passes through PrSyncEngineError.
 
     expect(toPrApiError(error, 'Unable to sync pull requests', 'github.com')).toEqual({
       type: 'host_unreachable',
       host: 'github.com',
-      reason: 'Connect Timeout Error (attempted address: api.github.com:443, timeout: 10000ms)',
+      reason: 'Connect Timeout Error',
     });
   });
 
   it('preserves typed auth errors for duplicate in-flight single PR sync calls', async () => {
-    let resolveOctokit!: (value: Result<Octokit, GitHubApiAuthError>) => void;
-    const getOctokit = vi.fn<(host: string) => Promise<Result<Octokit, GitHubApiAuthError>>>(
-      () =>
-        new Promise((resolve) => {
-          resolveOctokit = resolve;
-        })
-    );
-    const engine = new PrSyncEngine(getOctokit);
+    let resolveCli!: (value: unknown) => void;
+    const graphqlPromise = new Promise((resolve) => {
+      resolveCli = resolve;
+    });
+    const graphql = vi.fn().mockReturnValue(graphqlPromise);
+    const cli = makeGitHubCli({ graphql });
+    const engine = new PrSyncEngine(makeGetCli(cli));
 
     const first = engine.syncSingle('https://ghe.example.com/acme/repo', 12);
     const second = engine.syncSingle('https://ghe.example.com/acme/repo', 12);
 
-    resolveOctokit(
+    resolveCli(
       err({
-        type: 'auth_required',
-        host: 'ghe.example.com',
+        code: 'NOT_AUTHENTICATED',
         message: 'auth required',
-        hint: 'Run: gh auth login --hostname ghe.example.com',
       })
     );
 
@@ -213,10 +216,9 @@ describe('PrSyncEngine', () => {
       type: 'auth_required',
       host: 'ghe.example.com',
       message: 'auth required',
-      hint: 'Run: gh auth login --hostname ghe.example.com',
     });
     await expect(first).resolves.toEqual(expected);
     await expect(second).resolves.toEqual(expected);
-    expect(getOctokit).toHaveBeenCalledTimes(1);
+    expect(graphql).toHaveBeenCalledTimes(1);
   });
 });

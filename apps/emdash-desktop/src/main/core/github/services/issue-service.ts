@@ -1,11 +1,11 @@
-import type { Octokit } from '@octokit/rest';
 import type { IssueListError } from '@shared/issue-providers';
 import { err, ok, type Result } from '@shared/lib/result';
 import type { RepositoryRef } from '@shared/repository-ref';
+import type { GitHubCli } from '../cli/github-cli';
+import { type GitHubCliError } from '../cli/github-cli-errors';
+import { getGitHubCli } from '../cli/github-cli-provider';
 import type { GitHubApiAuthError } from './github-api-auth-errors';
 import type { GitHubApiAuthContext } from './github-api-auth-service';
-import { classifyGitHubApiError, type GitHubApiOperationError } from './github-api-errors';
-import { getOctokit } from './octokit-provider';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -71,10 +71,10 @@ interface RestIssue {
 
 export class GitHubIssueServiceImpl implements GitHubIssueService {
   constructor(
-    private readonly getOctokit: (
+    private readonly getCli: (
       host: string,
-      context?: GitHubApiAuthContext
-    ) => Promise<Result<Octokit, GitHubApiAuthError>>
+      authContext?: GitHubApiAuthContext
+    ) => Promise<Result<GitHubCli, GitHubApiAuthError>>
   ) {}
 
   async listIssues(
@@ -83,26 +83,22 @@ export class GitHubIssueServiceImpl implements GitHubIssueService {
     authContext: GitHubApiAuthContext = {}
   ): Promise<Result<GitHubIssue[], IssueListError>> {
     const { owner, repo, host } = repository;
-    const octokit = await this.getOctokit(host, authContext);
-    if (!octokit.success) return err(this.mapAuthError(octokit.error));
+    const cli = await this.getCli(host, authContext);
+    if (!cli.success) return err(this.mapAuthError(cli.error));
 
-    try {
-      const { data } = await octokit.data.rest.issues.listForRepo({
-        owner,
-        repo,
-        state: 'open',
-        per_page: Math.min(Math.max(limit, 1), 100),
-        sort: 'updated',
-        direction: 'desc',
-      });
-      return ok(
-        data
-          .filter((issue) => !issue.pull_request)
-          .map((item) => this.mapIssue(item as unknown as RestIssue))
-      );
-    } catch (error) {
-      return err(this.mapApiError(error, 'Unable to list GitHub issues', repository));
-    }
+    const result = await cli.data.rest<RestIssue[]>({
+      endpoint: `repos/${owner}/${repo}/issues?state=open&per_page=${Math.min(Math.max(limit, 1), 100)}&sort=updated&direction=desc`,
+      host,
+    });
+
+    if (!result.success) return err(this.mapApiError(result.error, repository));
+
+    return ok(
+      result.data
+        .filter((issue) => !issue.pull_request)
+        .slice(0, Math.max(limit, 0))
+        .map((item) => this.mapIssue(item))
+    );
   }
 
   async searchIssues(
@@ -114,20 +110,18 @@ export class GitHubIssueServiceImpl implements GitHubIssueService {
     const term = searchTerm.trim();
     if (!term) return ok([]);
     const { owner, repo, host } = repository;
-    const octokit = await this.getOctokit(host, authContext);
-    if (!octokit.success) return err(this.mapAuthError(octokit.error));
+    const cli = await this.getCli(host, authContext);
+    if (!cli.success) return err(this.mapAuthError(cli.error));
 
-    try {
-      const { data } = await octokit.data.rest.search.issuesAndPullRequests({
-        q: `${term} repo:${owner}/${repo} is:issue is:open`,
-        per_page: Math.min(Math.max(limit, 1), 100),
-        sort: 'updated',
-        order: 'desc',
-      });
-      return ok(data.items.map((item) => this.mapIssue(item as unknown as RestIssue)));
-    } catch (error) {
-      return err(this.mapApiError(error, 'Unable to search GitHub issues', repository));
-    }
+    const q = encodeURIComponent(`${term} repo:${owner}/${repo} is:issue is:open`);
+    const result = await cli.data.rest<{ items: RestIssue[] }>({
+      endpoint: `search/issues?q=${q}&per_page=${Math.min(Math.max(limit, 1), 100)}&sort=updated&order=desc`,
+      host,
+    });
+
+    if (!result.success) return err(this.mapApiError(result.error, repository));
+
+    return ok(result.data.items.map((item) => this.mapIssue(item)));
   }
 
   async getIssue(
@@ -136,19 +130,17 @@ export class GitHubIssueServiceImpl implements GitHubIssueService {
     authContext: GitHubApiAuthContext = {}
   ): Promise<Result<GitHubIssueDetail | null, IssueListError>> {
     const { owner, repo, host } = repository;
-    const octokit = await this.getOctokit(host, authContext);
-    if (!octokit.success) return err(this.mapAuthError(octokit.error));
+    const cli = await this.getCli(host, authContext);
+    if (!cli.success) return err(this.mapAuthError(cli.error));
 
-    try {
-      const { data } = await octokit.data.rest.issues.get({
-        owner,
-        repo,
-        issue_number: issueNumber,
-      });
-      return ok(this.mapIssue(data as unknown as RestIssue));
-    } catch (error) {
-      return err(this.mapApiError(error, 'Unable to get GitHub issue', repository));
-    }
+    const result = await cli.data.rest<RestIssue>({
+      endpoint: `repos/${owner}/${repo}/issues/${issueNumber}`,
+      host,
+    });
+
+    if (!result.success) return err(this.mapApiError(result.error, repository));
+
+    return ok(this.mapIssue(result.data));
   }
 
   private mapIssue(item: RestIssue): GitHubIssue {
@@ -200,44 +192,39 @@ export class GitHubIssueServiceImpl implements GitHubIssueService {
     }
   }
 
-  private mapApiError(error: unknown, fallback: string, repository: RepositoryRef): IssueListError {
-    return this.mapOperationError(
-      classifyGitHubApiError(error, {
-        host: repository.host,
-        nameWithOwner: repository.nameWithOwner,
-        fallback,
-      })
-    );
-  }
-
-  private mapOperationError(error: GitHubApiOperationError): IssueListError {
-    switch (error.type) {
-      case 'auth_required':
-        return { type: 'auth_required', host: error.host, message: error.message };
-      case 'not_found_or_no_access':
-        return { type: 'not_found_or_no_access', host: error.host, message: error.message };
-      case 'sso_required':
+  private mapApiError(error: GitHubCliError, repository: RepositoryRef): IssueListError {
+    switch (error.code) {
+      case 'NOT_AUTHENTICATED':
+        return { type: 'auth_required', host: repository.host, message: error.message };
+      case 'SSO_REQUIRED':
+        return { type: 'sso_required', host: repository.host, message: error.message };
+      case 'RATE_LIMITED':
+        return { type: 'rate_limited', host: repository.host, message: error.message };
+      case 'NETWORK_ERROR':
+      case 'TIMEOUT':
         return {
-          type: 'sso_required',
-          host: error.host,
+          type: 'host_unreachable',
+          host: repository.host,
           message: error.message,
-          ...(error.ssoUrl ? { ssoUrl: error.ssoUrl } : {}),
         };
-      case 'rate_limited':
-        return {
-          type: 'rate_limited',
-          host: error.host,
-          message: error.message,
-          ...(error.resetAt ? { resetAt: error.resetAt } : {}),
-        };
-      case 'forbidden':
-        return { type: 'forbidden', host: error.host, message: error.message };
-      case 'host_unreachable':
-        return { type: 'host_unreachable', host: error.host, message: error.reason };
-      case 'api_error':
+      case 'UNKNOWN_ERROR':
+        if (error.message.includes('rate limit')) {
+          return { type: 'rate_limited', host: repository.host, message: error.message };
+        }
+        if (error.message.includes('Not Found') || error.message.includes('404')) {
+          return {
+            type: 'not_found_or_no_access',
+            host: repository.host,
+            message: error.message,
+          };
+        }
+        return { type: 'generic', message: error.message };
+      case 'CLI_MISSING':
+        return { type: 'generic', message: 'GitHub CLI not installed.' };
+      default:
         return { type: 'generic', message: error.message };
     }
   }
 }
 
-export const issueService = new GitHubIssueServiceImpl(getOctokit);
+export const issueService = new GitHubIssueServiceImpl(getGitHubCli);

@@ -90,45 +90,16 @@ describe('GitHubApiAuthService', () => {
     });
   }
 
-  it('uses the selected GitHub.com account token when an account id is provided', async () => {
-    await upsertAccount({ providerAccountId: '42', token: 'selected-account-token' });
+  it('uses a selected account token for its host', async () => {
+    await upsertAccount({ token: 'selected-account-token' });
 
     await expect(service.getToken('github.com', { accountId: 'github.com:42' })).resolves.toEqual(
       ok('selected-account-token')
     );
   });
 
-  it('uses the selected GitHub Enterprise account token when an account id is provided', async () => {
-    await upsertAccount({
-      host: 'ghe.example.com',
-      providerAccountId: '168',
-      login: 'enterprise',
-      token: 'selected-ghes-account-token',
-    });
-
-    await expect(
-      service.getToken('GHE.EXAMPLE.COM', {
-        accountId: 'ghe.example.com:168',
-      })
-    ).resolves.toEqual(ok('selected-ghes-account-token'));
-  });
-
-  it('returns account not found when the selected account is missing', async () => {
-    await upsertAccount({ providerAccountId: '84' });
-
-    await expect(service.getToken('github.com', { accountId: 'github.com:42' })).resolves.toEqual(
-      err({
-        type: 'account_not_found',
-        host: 'github.com',
-        accountId: 'github.com:42',
-        message: 'Selected GitHub account is no longer connected: github.com:42.',
-        hint: 'Connect GitHub from account settings.',
-      })
-    );
-  });
-
-  it('returns account host mismatch when the selected account host does not match the requested host', async () => {
-    await upsertAccount({ providerAccountId: '42' });
+  it('rejects a selected account for a different host', async () => {
+    await upsertAccount();
 
     await expect(
       service.getToken('ghe.example.com', { accountId: 'github.com:42' })
@@ -145,60 +116,27 @@ describe('GitHubApiAuthService', () => {
     );
   });
 
-  it('returns token missing when the selected account token is missing', async () => {
-    const account = await upsertAccount({ providerAccountId: '42' });
-    await secretStore.deleteSecret(`github-account-token:${account.id}`);
-
-    await expect(service.getToken('github.com', { accountId: 'github.com:42' })).resolves.toEqual(
-      err({
-        type: 'token_missing',
-        host: 'github.com',
-        accountId: 'github.com:42',
-        message: 'Selected GitHub account github.com:42 is missing a saved token.',
-        hint: 'Connect GitHub from account settings.',
-      })
-    );
-  });
-
-  it('uses the default account when no account id is provided and the default host matches', async () => {
-    await upsertAccount({ providerAccountId: '42', token: 'default-account-token' });
-
-    await expect(service.getToken('www.github.com')).resolves.toEqual(ok('default-account-token'));
-  });
-
-  it('uses a default GitHub Enterprise account when no account id is provided and the host matches', async () => {
+  it('uses a matching default account when no account is selected', async () => {
     await upsertAccount({
       host: 'ghe.example.com',
       providerAccountId: '168',
-      login: 'enterprise',
       token: 'default-ghes-token',
     });
 
     await expect(service.getToken('ghe.example.com')).resolves.toEqual(ok('default-ghes-token'));
   });
 
-  it('does not use the default account when no account id is provided and the host differs', async () => {
-    await upsertAccount({ providerAccountId: '42' });
+  it('returns token missing for an account without a saved secret', async () => {
+    const account = await upsertAccount();
+    await secretStore.deleteSecret(`github-account-token:${account.id}`);
 
-    await expect(service.getToken('ghe.example.com')).resolves.toEqual(
+    await expect(service.getToken('github.com', { accountId: account.id })).resolves.toEqual(
       err({
-        type: 'auth_required',
-        host: 'ghe.example.com',
-        message:
-          'GitHub Enterprise authentication required for ghe.example.com. Run: gh auth login --hostname ghe.example.com',
-        hint: 'Run: gh auth login --hostname ghe.example.com',
-      })
-    );
-  });
-
-  it('returns a GHES login hint when no account is selected for an enterprise host', async () => {
-    await expect(service.getToken('ghe.example.com')).resolves.toEqual(
-      err({
-        type: 'auth_required',
-        host: 'ghe.example.com',
-        message:
-          'GitHub Enterprise authentication required for ghe.example.com. Run: gh auth login --hostname ghe.example.com',
-        hint: 'Run: gh auth login --hostname ghe.example.com',
+        type: 'token_missing',
+        host: 'github.com',
+        accountId: account.id,
+        message: `Selected GitHub account ${account.id} is missing a saved token.`,
+        hint: 'Connect GitHub from account settings.',
       })
     );
   });

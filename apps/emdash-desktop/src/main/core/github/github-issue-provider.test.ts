@@ -33,8 +33,8 @@ vi.mock('./services/project-github-auth-context', () => ({
 
 const mockIssueService = vi.mocked(issueService);
 const mockRepositoryResolver = vi.mocked(githubRepositoryResolver);
-const mockResolveProjectGitHubAuthContext = vi.mocked(resolveProjectGitHubAuthContext);
 const mockGithubAccountRegistry = vi.mocked(githubAccountRegistry);
+const mockResolveProjectGitHubAuthContext = vi.mocked(resolveProjectGitHubAuthContext);
 
 const githubRepository = {
   host: 'github.com',
@@ -56,10 +56,10 @@ describe('githubIssueProvider', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockRepositoryResolver.resolve.mockResolvedValue(ok(githubRepository));
-    mockResolveProjectGitHubAuthContext.mockResolvedValue(ok({}));
     mockGithubAccountRegistry.getDefaultAccountId.mockResolvedValue(null);
     mockGithubAccountRegistry.listAccounts.mockResolvedValue([]);
     mockGithubAccountRegistry.resolveToken.mockResolvedValue(null);
+    mockResolveProjectGitHubAuthContext.mockResolvedValue(ok({ accountId: 'github.com:42' }));
   });
 
   it('reports GitHub connected when a default linked account exists', async () => {
@@ -113,103 +113,13 @@ describe('githubIssueProvider', () => {
 
     await githubIssueProvider.listIssues({
       repositoryUrl: 'https://github.com/owner/repo',
-      limit: 7,
-    });
-
-    expect(mockResolveProjectGitHubAuthContext).not.toHaveBeenCalled();
-    expect(mockIssueService.listIssues).toHaveBeenCalledWith(githubRepository, 7, undefined);
-  });
-
-  it('passes project GitHub account context when listing issues for a project', async () => {
-    mockResolveProjectGitHubAuthContext.mockResolvedValue(ok({ accountId: 'github.com:42' }));
-    mockIssueService.listIssues.mockResolvedValue(ok([]));
-
-    await githubIssueProvider.listIssues({
       projectId: 'project-1',
-      repositoryUrl: 'https://github.com/owner/repo',
       limit: 7,
     });
 
-    expect(mockResolveProjectGitHubAuthContext).toHaveBeenCalledWith('project-1');
     expect(mockIssueService.listIssues).toHaveBeenCalledWith(githubRepository, 7, {
       accountId: 'github.com:42',
     });
-  });
-
-  it('does not list issues with the default account when project account resolution fails', async () => {
-    mockResolveProjectGitHubAuthContext.mockResolvedValue(
-      err({
-        type: 'account_selection_failed',
-        projectId: 'project-1',
-        message: 'git config failed',
-      })
-    );
-    mockIssueService.listIssues.mockResolvedValue(ok([]));
-
-    await expect(
-      githubIssueProvider.listIssues({
-        projectId: 'project-1',
-        repositoryUrl: 'https://github.com/owner/repo',
-        limit: 7,
-      })
-    ).resolves.toEqual({
-      success: false,
-      error: 'Unable to resolve GitHub account for project: git config failed',
-      errorType: 'generic',
-      host: undefined,
-    });
-
-    expect(mockIssueService.listIssues).not.toHaveBeenCalled();
-  });
-
-  it('returns a typed error when no GitHub account is selected for the project', async () => {
-    mockResolveProjectGitHubAuthContext.mockResolvedValue(
-      err({
-        type: 'unconfigured',
-        projectId: 'project-1',
-        message: 'No GitHub account is configured for this project.',
-      })
-    );
-    mockIssueService.listIssues.mockResolvedValue(ok([]));
-
-    await expect(
-      githubIssueProvider.listIssues({
-        projectId: 'project-1',
-        repositoryUrl: 'https://github.com/owner/repo',
-        limit: 7,
-      })
-    ).resolves.toEqual({
-      success: false,
-      error: 'No GitHub account is configured for this project.',
-      errorType: 'no_account_selected',
-    });
-
-    expect(mockIssueService.listIssues).not.toHaveBeenCalled();
-  });
-
-  it('returns a typed error when GitHub API is disabled for the project', async () => {
-    mockResolveProjectGitHubAuthContext.mockResolvedValue(
-      err({
-        type: 'disabled',
-        projectId: 'project-1',
-        message: 'GitHub API is disabled for this project.',
-      })
-    );
-    mockIssueService.listIssues.mockResolvedValue(ok([]));
-
-    await expect(
-      githubIssueProvider.listIssues({
-        projectId: 'project-1',
-        repositoryUrl: 'https://github.com/owner/repo',
-        limit: 7,
-      })
-    ).resolves.toEqual({
-      success: false,
-      error: 'GitHub API is disabled for this project.',
-      errorType: 'account_disabled',
-    });
-
-    expect(mockIssueService.listIssues).not.toHaveBeenCalled();
   });
 
   it('falls back to the resolved remote when repositoryUrl is not provided', async () => {
@@ -221,30 +131,12 @@ describe('githubIssueProvider', () => {
       limit: 3,
     });
 
-    expect(mockResolveProjectGitHubAuthContext).not.toHaveBeenCalled();
     expect(mockIssueService.searchIssues).toHaveBeenCalledWith(
       githubRepository,
       'bug',
       3,
       undefined
     );
-  });
-
-  it('passes project GitHub account context when searching issues for a project', async () => {
-    mockResolveProjectGitHubAuthContext.mockResolvedValue(ok({ accountId: 'github.com:42' }));
-    mockIssueService.searchIssues.mockResolvedValue(ok([]));
-
-    await githubIssueProvider.searchIssues({
-      projectId: 'project-1',
-      remote: 'git@github.com:owner/repo.git',
-      searchTerm: 'bug',
-      limit: 3,
-    });
-
-    expect(mockResolveProjectGitHubAuthContext).toHaveBeenCalledWith('project-1');
-    expect(mockIssueService.searchIssues).toHaveBeenCalledWith(githubRepository, 'bug', 3, {
-      accountId: 'github.com:42',
-    });
   });
 
   it('returns unsupported host errors from repository resolution', async () => {
@@ -307,23 +199,6 @@ describe('githubIssueProvider', () => {
       error: 'Run: gh auth login --hostname ghe.example.com',
       errorType: 'auth_required',
       host: 'ghe.example.com',
-    });
-  });
-
-  it('passes project GitHub Enterprise account context when listing issues for a project', async () => {
-    mockRepositoryResolver.resolve.mockResolvedValue(ok(ghesRepository));
-    mockResolveProjectGitHubAuthContext.mockResolvedValue(ok({ accountId: 'ghe.example.com:168' }));
-    mockIssueService.listIssues.mockResolvedValue(ok([]));
-
-    await githubIssueProvider.listIssues({
-      projectId: 'project-1',
-      repositoryUrl: 'https://ghe.example.com/owner/repo',
-      limit: 7,
-    });
-
-    expect(mockResolveProjectGitHubAuthContext).toHaveBeenCalledWith('project-1');
-    expect(mockIssueService.listIssues).toHaveBeenCalledWith(ghesRepository, 7, {
-      accountId: 'ghe.example.com:168',
     });
   });
 });

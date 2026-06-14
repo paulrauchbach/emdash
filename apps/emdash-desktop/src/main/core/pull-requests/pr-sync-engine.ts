@@ -1,9 +1,9 @@
 import { randomUUID } from 'node:crypto';
-import type { Octokit } from '@octokit/rest';
 import { and, eq, inArray, lt, ne } from 'drizzle-orm';
+import type { GitHubCli } from '@main/core/github/cli/github-cli';
+import { getGitHubCli } from '@main/core/github/cli/github-cli-provider';
 import type { GitHubApiAuthError } from '@main/core/github/services/github-api-auth-errors';
 import type { GitHubApiAuthContext } from '@main/core/github/services/github-api-auth-service';
-import { getOctokit } from '@main/core/github/services/octokit-provider';
 import {
   GET_PR_BY_NUMBER_QUERY,
   GET_PR_CHECK_RUNS_BY_URL_QUERY,
@@ -172,6 +172,35 @@ interface GqlStatusContextNode {
   createdAt: string;
 }
 
+interface RestPullRequestComment {
+  id: number;
+  body: string | null;
+  html_url: string;
+  user: { id: number; login: string; avatar_url: string; html_url: string } | null;
+  path?: string | null;
+  line?: number | null;
+  original_line?: number | null;
+  position?: number | null;
+  created_at: string;
+  updated_at: string;
+}
+
+interface RestPullRequestReview {
+  id: number;
+  body: string | null;
+  html_url: string;
+  user: { id: number; login: string; avatar_url: string; html_url: string } | null;
+  submitted_at: string | null;
+}
+
+interface RestPullRequestFile {
+  filename: string;
+  status: string;
+  additions: number;
+  deletions: number;
+  patch?: string;
+}
+
 // ---------------------------------------------------------------------------
 // PrSyncEngine
 // ---------------------------------------------------------------------------
@@ -190,10 +219,10 @@ export class PrSyncEngine {
   private readonly _checksInflight = new Map<string, Promise<Result<boolean, PrSyncEngineError>>>();
 
   constructor(
-    private readonly getOctokit: (
+    private readonly getCli: (
       host: string,
       context?: PrSyncAuthContext
-    ) => Promise<Result<Octokit, GitHubApiAuthError>>
+    ) => Promise<Result<GitHubCli, GitHubApiAuthError>>
   ) {}
 
   // ── Public sync API ────────────────────────────────────────────────────────
@@ -346,19 +375,15 @@ export class PrSyncEngine {
       return err(repository.error);
     }
     const { owner, repo } = repository.data;
-    const octokit = await this.getOctokit(repository.data.host, authContext);
-    if (!octokit.success) {
-      log.warn('PrSyncEngine: runFullSync — failed to get Octokit', {
-        repositoryUrl,
-        error: octokit.error,
-      });
+    const cli = await this.getCli(repository.data.host, authContext);
+    if (!cli.success) {
       this._emitProgress({
         remoteUrl: repositoryUrl,
         kind: 'full',
         status: 'error',
-        error: prSyncEngineErrorMessage(octokit.error),
+        error: prSyncEngineErrorMessage(cli.error),
       });
-      return err(octokit.error);
+      return err(cli.error);
     }
 
     // Resume from an existing cursor if available
@@ -388,23 +413,32 @@ export class PrSyncEngine {
         const response = await withRetry(
           () =>
             githubRateLimiter.acquire().then(() =>
-              octokit.data.graphql<{
-                repository: {
-                  pullRequests: {
-                    totalCount: number;
-                    pageInfo: {
-                      hasNextPage: boolean;
-                      endCursor: string | null;
+              cli.data
+                .graphql<{
+                  repository: {
+                    pullRequests: {
+                      totalCount: number;
+                      pageInfo: {
+                        hasNextPage: boolean;
+                        endCursor: string | null;
+                      };
+                      nodes: GqlPrNode[];
                     };
-                    nodes: GqlPrNode[];
                   };
-                };
-              }>(SYNC_PRS_QUERY, {
-                owner,
-                repo,
-                cursor: pageCursor ?? null,
-                request: { signal },
-              })
+                }>({
+                  query: SYNC_PRS_QUERY,
+                  variables: {
+                    owner,
+                    repo,
+                    cursor: pageCursor ?? null,
+                  },
+                  host: repository.data.host,
+                  signal,
+                })
+                .then((res) => {
+                  if (!res.success) throw res.error;
+                  return res.data;
+                })
             ),
           { signal }
         );
@@ -498,19 +532,15 @@ export class PrSyncEngine {
       return err(repository.error);
     }
     const { owner, repo } = repository.data;
-    const octokit = await this.getOctokit(repository.data.host, authContext);
-    if (!octokit.success) {
-      log.warn('PrSyncEngine: runIncrementalSync — failed to get Octokit', {
-        repositoryUrl,
-        error: octokit.error,
-      });
+    const cli = await this.getCli(repository.data.host, authContext);
+    if (!cli.success) {
       this._emitProgress({
         remoteUrl: repositoryUrl,
         kind: 'incremental',
         status: 'error',
-        error: prSyncEngineErrorMessage(octokit.error),
+        error: prSyncEngineErrorMessage(cli.error),
       });
-      return err(octokit.error);
+      return err(cli.error);
     }
 
     const fullCursor = (await this.kv.get(`fullsync:${repositoryUrl}`)) as FullSyncCursor | null;
@@ -547,22 +577,31 @@ export class PrSyncEngine {
         const response = await withRetry(
           () =>
             githubRateLimiter.acquire().then(() =>
-              octokit.data.graphql<{
-                repository: {
-                  pullRequests: {
-                    pageInfo: {
-                      hasNextPage: boolean;
-                      endCursor: string | null;
+              cli.data
+                .graphql<{
+                  repository: {
+                    pullRequests: {
+                      pageInfo: {
+                        hasNextPage: boolean;
+                        endCursor: string | null;
+                      };
+                      nodes: GqlPrNode[];
                     };
-                    nodes: GqlPrNode[];
                   };
-                };
-              }>(INCREMENTAL_SYNC_PRS_QUERY, {
-                owner,
-                repo,
-                cursor: pageCursor ?? null,
-                request: { signal },
-              })
+                }>({
+                  query: INCREMENTAL_SYNC_PRS_QUERY,
+                  variables: {
+                    owner,
+                    repo,
+                    cursor: pageCursor ?? null,
+                  },
+                  host: repository.data.host,
+                  signal,
+                })
+                .then((res) => {
+                  if (!res.success) throw res.error;
+                  return res.data;
+                })
             ),
           { signal }
         );
@@ -700,16 +739,26 @@ export class PrSyncEngine {
     const repository = parseRepositoryRefResult(repositoryUrl);
     if (!repository.success) return err(repository.error);
     const { owner, repo } = repository.data;
-    const octokit = await this.getOctokit(repository.data.host, authContext);
-    if (!octokit.success) return err(octokit.error);
+    const cli = await this.getCli(repository.data.host, authContext);
+    if (!cli.success) return err(cli.error);
 
     let response: { repository: { pullRequest: GqlPrNode | null } };
     try {
       response = await withRetry(() =>
         githubRateLimiter.acquire().then(() =>
-          octokit.data.graphql<{
-            repository: { pullRequest: GqlPrNode | null };
-          }>(GET_PR_BY_NUMBER_QUERY, { owner, repo, number: prNumber })
+          cli.data
+            .graphql<{
+              repository: { pullRequest: GqlPrNode | null };
+            }>({
+              query: GET_PR_BY_NUMBER_QUERY,
+              variables: { owner, repo, number: prNumber },
+              host: repository.data.host,
+              signal,
+            })
+            .then((res) => {
+              if (!res.success) throw res.error;
+              return res.data;
+            })
         )
       );
     } catch (error) {
@@ -816,8 +865,8 @@ export class PrSyncEngine {
     const repository = parseRepositoryRefResult(pr[0].repositoryUrl);
     if (!repository.success) return err(repository.error);
     const { owner, repo } = repository.data;
-    const octokit = await this.getOctokit(repository.data.host, authContext);
-    if (!octokit.success) return err(octokit.error);
+    const cli = await this.getCli(repository.data.host, authContext);
+    if (!cli.success) return err(cli.error);
 
     type CheckNode = GqlCheckRunNode | GqlStatusContextNode;
     const allNodes: CheckNode[] = [];
@@ -851,12 +900,22 @@ export class PrSyncEngine {
       try {
         response = await withRetry(() =>
           githubRateLimiter.acquire().then(() =>
-            octokit.data.graphql(GET_PR_CHECK_RUNS_BY_URL_QUERY, {
-              owner,
-              repo,
-              number: prNumber,
-              cursor: cursor ?? null,
-            })
+            cli.data
+              .graphql<typeof response>({
+                query: GET_PR_CHECK_RUNS_BY_URL_QUERY,
+                variables: {
+                  owner,
+                  repo,
+                  number: prNumber,
+                  cursor: cursor ?? null,
+                },
+                host: repository.data.host,
+                signal,
+              })
+              .then((res) => {
+                if (!res.success) throw res.error;
+                return res.data;
+              })
           )
         );
       } catch (error) {
@@ -1234,18 +1293,24 @@ export class PrSyncEngine {
     const repository = parseRepositoryRefResult(params.repositoryUrl);
     if (!repository.success) return err(repository.error);
     const { owner, repo } = repository.data;
-    const octokit = await this.getOctokit(repository.data.host, authContext);
-    if (!octokit.success) return err(octokit.error);
+    const cli = await this.getCli(repository.data.host, authContext);
+    if (!cli.success) return err(cli.error);
+
     try {
-      const response = await octokit.data.rest.pulls.create({
-        owner,
-        repo,
-        head: params.head,
-        base: params.base,
-        title: params.title,
-        body: params.body,
-        draft: params.draft,
+      const res = await cli.data.rest<{ html_url: string; number: number }>({
+        endpoint: `repos/${owner}/${repo}/pulls`,
+        method: 'POST',
+        body: {
+          title: params.title,
+          head: params.head,
+          base: params.base,
+          body: params.body,
+          draft: params.draft,
+        },
+        host: repository.data.host,
       });
+      if (!res.success) throw res.error;
+      const response = { data: res.data };
       const { html_url: url, number } = response.data;
       return ok({ url, number });
     } catch (error) {
@@ -1269,19 +1334,21 @@ export class PrSyncEngine {
     const repository = parseRepositoryRefResult(repositoryUrl);
     if (!repository.success) return err(repository.error);
     const { owner, repo } = repository.data;
-    const octokit = await this.getOctokit(repository.data.host, authContext);
-    if (!octokit.success) return err(octokit.error);
+    const cli = await this.getCli(repository.data.host, authContext);
+    if (!cli.success) return err(cli.error);
+
     try {
       // GitHub exposes bypassing branch protection/rulesets through the caller's permissions,
       // not a REST merge parameter. `bypassRequirements` is captured by the UI/telemetry path;
       // the merge request itself remains identical and GitHub accepts or rejects it server-side.
-      const response = await octokit.data.rest.pulls.merge({
-        owner,
-        repo,
-        pull_number: prNumber,
-        merge_method: options.strategy,
-        sha: options.commitHeadOid,
+      const res = await cli.data.rest<{ sha: string | null; merged: boolean }>({
+        endpoint: `repos/${owner}/${repo}/pulls/${prNumber}/merge`,
+        method: 'PUT',
+        body: { merge_method: options.strategy, sha: options.commitHeadOid },
+        host: repository.data.host,
       });
+      if (!res.success) throw res.error;
+      const response = { data: res.data };
       return ok({
         sha: response.data.sha ?? null,
         merged: response.data.merged,
@@ -1306,22 +1373,26 @@ export class PrSyncEngine {
     const repository = parseRepositoryRefResult(repositoryUrl);
     if (!repository.success) return err(repository.error);
     const { owner, repo } = repository.data;
-    const octokit = await this.getOctokit(repository.data.host, authContext);
-    if (!octokit.success) return err(octokit.error);
+    const cli = await this.getCli(repository.data.host, authContext);
+    if (!cli.success) return err(cli.error);
+
     try {
-      const { data } = await octokit.data.rest.pulls.get({
-        owner,
-        repo,
-        pull_number: prNumber,
+      const res = await cli.data.rest<{ node_id: string }>({
+        endpoint: `repos/${owner}/${repo}/pulls/${prNumber}`,
+        host: repository.data.host,
       });
-      await octokit.data.graphql(
-        `mutation MarkReadyForReview($id: ID!) {
+      if (!res.success) throw res.error;
+      const data = res.data;
+      const gqlRes = await cli.data.graphql<{ markPullRequestReadyForReview: unknown }>({
+        query: `mutation MarkReadyForReview($id: ID!) {
         markPullRequestReadyForReview(input: { pullRequestId: $id }) {
           pullRequest { isDraft }
         }
       }`,
-        { id: data.node_id }
-      );
+        variables: { id: data.node_id },
+        host: repository.data.host,
+      });
+      if (!gqlRes.success) throw gqlRes.error;
       return ok();
     } catch (error) {
       return err(
@@ -1343,40 +1414,53 @@ export class PrSyncEngine {
     const repository = parseRepositoryRefResult(repositoryUrl);
     if (!repository.success) return err(repository.error);
     const { owner, repo } = repository.data;
-    const octokit = await this.getOctokit(repository.data.host, authContext);
-    if (!octokit.success) return err(octokit.error);
+    const cli = await this.getCli(repository.data.host, authContext);
+    if (!cli.success) return err(cli.error);
+
     const pullRequestUrl = `${repository.data.repositoryUrl}/pull/${prNumber}`;
 
     try {
       const [issueComments, reviewComments, reviews] = await Promise.all([
         withRetry(() =>
           githubRateLimiter.acquire().then(() =>
-            octokit.data.paginate(octokit.data.rest.issues.listComments, {
-              owner,
-              repo,
-              issue_number: prNumber,
-              per_page: 100,
-            })
+            cli.data
+              .rest<RestPullRequestComment[]>({
+                endpoint: `repos/${owner}/${repo}/issues/${prNumber}/comments?per_page=100`,
+                paginate: true,
+                host: repository.data.host,
+              })
+              .then((r) => {
+                if (!r.success) throw r.error;
+                return r.data;
+              })
           )
         ),
         withRetry(() =>
           githubRateLimiter.acquire().then(() =>
-            octokit.data.paginate(octokit.data.rest.pulls.listReviewComments, {
-              owner,
-              repo,
-              pull_number: prNumber,
-              per_page: 100,
-            })
+            cli.data
+              .rest<RestPullRequestComment[]>({
+                endpoint: `repos/${owner}/${repo}/pulls/${prNumber}/comments?per_page=100`,
+                paginate: true,
+                host: repository.data.host,
+              })
+              .then((r) => {
+                if (!r.success) throw r.error;
+                return r.data;
+              })
           )
         ),
         withRetry(() =>
           githubRateLimiter.acquire().then(() =>
-            octokit.data.paginate(octokit.data.rest.pulls.listReviews, {
-              owner,
-              repo,
-              pull_number: prNumber,
-              per_page: 100,
-            })
+            cli.data
+              .rest<RestPullRequestReview[]>({
+                endpoint: `repos/${owner}/${repo}/pulls/${prNumber}/reviews?per_page=100`,
+                paginate: true,
+                host: repository.data.host,
+              })
+              .then((r) => {
+                if (!r.success) throw r.error;
+                return r.data;
+              })
           )
         ),
       ]);
@@ -1448,15 +1532,17 @@ export class PrSyncEngine {
     const repository = parseRepositoryRefResult(repositoryUrl);
     if (!repository.success) return err(repository.error);
     const { owner, repo } = repository.data;
-    const octokit = await this.getOctokit(repository.data.host, authContext);
-    if (!octokit.success) return err(octokit.error);
+    const cli = await this.getCli(repository.data.host, authContext);
+    if (!cli.success) return err(cli.error);
+
     try {
-      const files = await octokit.data.paginate(octokit.data.rest.pulls.listFiles, {
-        owner,
-        repo,
-        pull_number: prNumber,
-        per_page: 100,
+      const res = await cli.data.rest<RestPullRequestFile[]>({
+        endpoint: `repos/${owner}/${repo}/pulls/${prNumber}/files?per_page=100`,
+        paginate: true,
+        host: repository.data.host,
       });
+      if (!res.success) throw res.error;
+      const files = res.data;
       return ok(
         files.map((f) => ({
           filename: f.filename,
@@ -1483,4 +1569,4 @@ export class PrSyncEngine {
   }
 }
 
-export const prSyncEngine = new PrSyncEngine(getOctokit);
+export const prSyncEngine = new PrSyncEngine(getGitHubCli);

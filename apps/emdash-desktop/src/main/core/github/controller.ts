@@ -6,17 +6,13 @@ import { SshFileSystem } from '@main/core/fs/impl/ssh-fs';
 import type { FileSystemProvider } from '@main/core/fs/types';
 import { cloneRepository, initializeNewProject } from '@main/core/git/impl/git-repo-utils';
 import { githubAccountService } from '@main/core/github/accounts/github-account-service-instance';
-import { githubDeviceFlowService } from '@main/core/github/services/github-device-flow-service-instance';
 import { repoService } from '@main/core/github/services/repo-service';
 import { sshConnectionManager } from '@main/core/ssh/lifecycle/production-ssh-connection-manager';
-import { events } from '@main/lib/events';
 import { log } from '@main/lib/logger';
 import { telemetryService } from '@main/lib/telemetry';
-import { githubAuthErrorChannel, githubAuthSuccessChannel } from '@shared/events/githubEvents';
 import type {
   GitHubAccountState,
   GitHubAccountSummary,
-  GitHubAuthResponse,
   GitHubImportCliAccountsResponse,
   GitHubRemoveAccountResponse,
   GitHubSetDefaultAccountResponse,
@@ -35,45 +31,6 @@ export const githubController = createRPCController({
     } catch (error) {
       log.error('Failed to get GitHub account state:', error);
       return { connected: false, accounts: [], defaultAccountId: null };
-    }
-  },
-
-  auth: async (): Promise<GitHubAuthResponse> => {
-    let result: Awaited<ReturnType<typeof githubDeviceFlowService.start>>;
-    try {
-      result = await githubDeviceFlowService.start();
-    } catch (error) {
-      log.error('GitHub authentication failed:', error);
-      events.emit(githubAuthErrorChannel, {
-        error: 'device_flow_error',
-        message: 'Authentication failed',
-      });
-      return { success: false, error: 'Authentication failed' };
-    }
-
-    if (!result.success) return result;
-
-    try {
-      const accountSummary = (await githubAccountService.listAccounts()).find(
-        (candidate) => candidate.accountId === result.account.id
-      );
-      if (!accountSummary) {
-        const message = 'Failed to register GitHub account';
-        events.emit(githubAuthErrorChannel, { error: 'account_registration_failed', message });
-        return { success: false, error: message };
-      }
-
-      telemetryService.capture('integration_connected', { provider: 'github' });
-      events.emit(githubAuthSuccessChannel, { user: result.user });
-      return { success: true, account: accountSummary };
-    } catch (error) {
-      log.error('Failed to register GitHub account after device flow:', error);
-      const message = 'Failed to register GitHub account';
-      events.emit(githubAuthErrorChannel, {
-        error: 'account_registration_failed',
-        message,
-      });
-      return { success: false, error: message };
     }
   },
 
@@ -119,16 +76,6 @@ export const githubController = createRPCController({
     } catch (error) {
       log.error('Failed to remove GitHub account:', error);
       return { success: false, error: 'Failed to remove GitHub account' };
-    }
-  },
-
-  authCancel: async () => {
-    try {
-      githubDeviceFlowService.cancel();
-      return { success: true };
-    } catch (error) {
-      log.error('Failed to cancel GitHub auth:', error);
-      return { success: false, error: 'Failed to cancel' };
     }
   },
 

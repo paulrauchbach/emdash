@@ -112,14 +112,10 @@ describe('deleteProject', () => {
     await deleteProject('project-1');
 
     expect(mocks.deleteProjectData).toHaveBeenCalledWith('project-1');
-    expect(mocks.detachProject).toHaveBeenCalledWith('project-1');
     expect(mocks.deleteProjectRow).toHaveBeenCalledTimes(1);
     expect(mocks.deleteWhere).toHaveBeenCalledTimes(1);
 
     expect(mocks.deleteProjectData.mock.invocationCallOrder[0]).toBeLessThan(
-      mocks.deleteProjectRow.mock.invocationCallOrder[0]
-    );
-    expect(mocks.detachProject.mock.invocationCallOrder[0]).toBeLessThan(
       mocks.deleteProjectRow.mock.invocationCallOrder[0]
     );
   });

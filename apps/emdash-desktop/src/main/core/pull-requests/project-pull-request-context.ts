@@ -36,20 +36,20 @@ async function resolveProjectPullRequestSourceContext(
   });
 }
 
-export async function resolveProjectPullRequestContext(
-  projectId: string
-): Promise<Result<ProjectPullRequestContext, PullRequestError>> {
-  const context = await resolveProjectPullRequestSourceContext(projectId);
-  if (context.success) return ok(context.data);
-  return err(collapseSourceContextErrorForPullRequests(context.error));
-}
-
 export async function resolveProjectPullRequestAuthContext(
   projectId: string
 ): Promise<Result<GitHubApiAuthContext, PullRequestError>> {
   const authContext = await resolveProjectGitHubAuthContext(projectId);
   if (authContext.success) return ok(authContext.data);
   return err(collapseAuthContextErrorForPullRequests(authContext.error));
+}
+
+export async function resolveProjectPullRequestContext(
+  projectId: string
+): Promise<Result<ProjectPullRequestContext, PullRequestError>> {
+  const context = await resolveProjectPullRequestSourceContext(projectId);
+  if (context.success) return ok(context.data);
+  return err(collapseSourceContextErrorForPullRequests(context.error));
 }
 
 function collapseSourceContextErrorForPullRequests(
