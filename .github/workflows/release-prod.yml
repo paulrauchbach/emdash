@@ -1,4 +1,4 @@
-name: Release (Production)
+name: Build (Personal)
 
 on:
   workflow_dispatch:
@@ -6,19 +6,12 @@ on:
       arch:
         description: 'Architecture to build (arm64 | x64 | both)'
         required: false
-        default: 'both'
-
-permissions:
-  contents: write
+        default: 'x64'
 
 jobs:
-  release-linux:
-    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+  build-linux:
     runs-on: ubuntu-latest
     container: ubuntu:22.04
-    permissions:
-      contents: write
-    environment: release
     steps:
       - name: Install system build dependencies
         env:
@@ -41,18 +34,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-build
         with:
-          posthog-key: ${{ secrets.POSTHOG_PROJECT_API_KEY }}
-          posthog-host: ${{ secrets.POSTHOG_HOST }}
           setup-python: 'false'
 
       - run: pnpm run build
 
-      - run: echo "NODE_OPTIONS=${NODE_OPTIONS:-not set}" && node --version
-
       - name: Build Linux packages
         working-directory: apps/emdash-desktop
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: >
           node --experimental-strip-types scripts/release/build.ts
           --platform linux --arch x64
@@ -61,25 +48,22 @@ jobs:
         working-directory: apps/emdash-desktop
         run: node --experimental-strip-types scripts/release/verify-linux.ts
 
-      - uses: ./.github/actions/upload-r2
+      - name: Upload Linux installers
+        uses: actions/upload-artifact@v4
         with:
-          r2-account-id: ${{ secrets.R2_ACCOUNT_ID }}
-          r2-access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
-          r2-secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          r2-bucket: ${{ secrets.R2_BUCKET }}
+          name: emdash-linux
+          retention-days: 1
+          path: |
+            apps/emdash-desktop/release/*.AppImage
+            apps/emdash-desktop/release/*.deb
+            apps/emdash-desktop/release/*.rpm
 
-  release-win:
-    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+  build-win:
     runs-on: windows-2022
-    permissions:
-      contents: write
-    environment: release
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-build
         with:
-          posthog-key: ${{ secrets.POSTHOG_PROJECT_API_KEY }}
-          posthog-host: ${{ secrets.POSTHOG_HOST }}
           windows-native: 'true'
       - name: Export Python path for native modules
         shell: bash
@@ -89,124 +73,50 @@ jobs:
         shell: bash
         run: pnpm run build
 
-      - shell: bash
-        run: echo "NODE_OPTIONS=${NODE_OPTIONS:-not set}" && node --version
-
-      - name: Check Azure Trusted Signing secrets
-        id: signing
-        shell: bash
-        env:
-          AZ_TENANT: ${{ secrets.AZURE_TENANT_ID }}
-          AZ_CLIENT: ${{ secrets.AZURE_CLIENT_ID }}
-          AZ_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
-        run: |
-          if [ -n "$AZ_TENANT" ] && [ -n "$AZ_CLIENT" ] && [ -n "$AZ_SECRET" ]; then
-            echo "has_signing=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "has_signing=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::Azure Trusted Signing secrets not configured. Windows build will be unsigned."
-          fi
-
       - name: Build Windows packages
         shell: bash
         working-directory: apps/emdash-desktop
-        env:
-          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: >
           node --experimental-strip-types scripts/release/build.ts
           --platform win --arch x64
 
-      - name: Verify Windows code signature
-        if: ${{ steps.signing.outputs.has_signing == 'true' }}
-        shell: bash
-        working-directory: apps/emdash-desktop
-        run: node --experimental-strip-types scripts/release/verify-win.ts
-
-      - name: Upload to R2
-        uses: ./.github/actions/upload-r2
+      - name: Upload Windows installers
+        uses: actions/upload-artifact@v4
         with:
-          r2-account-id: ${{ secrets.R2_ACCOUNT_ID }}
-          r2-access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
-          r2-secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          r2-bucket: ${{ secrets.R2_BUCKET }}
+          name: emdash-windows
+          retention-days: 1
+          path: |
+            apps/emdash-desktop/release/*.exe
+            apps/emdash-desktop/release/*.msi
 
-  release-mac:
-    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
-    runs-on: macos-latest
-    permissions:
-      contents: write
-    environment: release
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup-build
-        with:
-          posthog-key: ${{ secrets.POSTHOG_PROJECT_API_KEY }}
-          posthog-host: ${{ secrets.POSTHOG_HOST }}
-
-      - name: Import Apple signing certificate
-        uses: apple-actions/import-codesign-certs@v2
-        with:
-          p12-file-base64: ${{ secrets.CERTIFICATE_P12 }}
-          p12-password: ${{ secrets.CERTIFICATE_PASSWORD }}
-
-      - run: pnpm run build
-
-      - run: echo "NODE_OPTIONS=${NODE_OPTIONS:-not set}" && node --version
-
-      - name: Build signed DMGs + ZIPs
-        working-directory: apps/emdash-desktop
-        env:
-          CSC_IDENTITY_AUTO_DISCOVERY: 'true'
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: >
-          node --experimental-strip-types scripts/release/build.ts
-          --platform mac --arch ${{ github.event.inputs.arch || 'both' }} --targets dmg,zip
-
-      - name: Notarize and staple
-        working-directory: apps/emdash-desktop
-        env:
-          APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY }}
-          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
-          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-        run: node --experimental-strip-types scripts/release/notarize-mac.ts --app-bundle "Emdash.app"
-
-      - name: Upload to R2
-        uses: ./.github/actions/upload-r2
-        with:
-          r2-account-id: ${{ secrets.R2_ACCOUNT_ID }}
-          r2-access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
-          r2-secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          r2-bucket: ${{ secrets.R2_BUCKET }}
-
-  finalize-release:
-    needs: [release-linux, release-win, release-mac]
+  publish-release:
+    needs: [build-linux, build-win]
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    environment: release
     steps:
       - uses: actions/checkout@v4
 
-      - uses: pnpm/action-setup@v4
+      - name: Download all installers
+        uses: actions/download-artifact@v4
         with:
-          version: 10.28.2
+          path: artifacts
+          merge-multiple: true
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '24'
-          cache: pnpm
+      - name: Resolve release tag
+        id: meta
+        run: |
+          version="$(node -p "require('./apps/emdash-desktop/package.json').version")"
+          echo "tag=v${version}-build.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "title=Emdash v${version} (build ${GITHUB_RUN_NUMBER})" >> "$GITHUB_OUTPUT"
 
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Publish GitHub release draft
-        working-directory: apps/emdash-desktop
+      - name: Create GitHub Release
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: node --experimental-strip-types scripts/release/finalize-release.ts
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "${{ steps.meta.outputs.tag }}"
+          artifacts/*
+          --repo "$GITHUB_REPOSITORY"
+          --target "$GITHUB_SHA"
+          --title "${{ steps.meta.outputs.title }}"
+          --notes "Personal build of ${GITHUB_SHA} from run #${GITHUB_RUN_NUMBER}."
