@@ -106,7 +106,7 @@ try {
       targets: buildTargets,
       config,
       projectDir: deployDir,
-      publish: 'always',
+      publish: 'never',
     });
 
     info(`Built ${platform} ${targetList.join(' ')} for ${arch}`);
